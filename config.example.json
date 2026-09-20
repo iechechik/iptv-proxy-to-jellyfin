@@ -1,0 +1,121 @@
+{
+    "epg": {
+        "sources": [
+            {
+                "name": "example_epg",
+                "url": "https://example.com/epg.xml.gz",
+                "interval": 43200,
+                "comment": "Замените URL на реальный источник EPG. Поддерживается gzip и обычный XML."
+            }
+        ],
+        "update_time": "02:35",
+        "cache_path": "epg_filtered.xml.gz",
+        "db_file": "/app/db/epg.db",
+        "download_timeout": 60,
+        "head_timeout": 10
+    },
+    "server": {
+        "manage_url": "http://iptv-proxy:8000",
+        "override_file": "override.json"
+    },
+    "jellyfin": {
+        "url": "http://jellyfin:8096",
+        "xmltv_cache_dir": "/jellyfin-xmltv-cache",
+        "api_timeout": 15,
+        "comment_api_key": "API-ключ Jellyfin задаётся переменной окружения IPTV_JELLYFIN_API_KEY"
+    },
+    "resolver": {
+        "default_ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+        "playwright_chromium": "/usr/bin/chromium",
+        "flaresolverr_url": "http://flaresolverr:8191/v1",
+        "order": [
+            "direct",
+            "yt-dlp",
+            "streamlink",
+            "flaresolverr_simple",
+            "flaresolverr_session",
+            "sniffer"
+        ],
+        "streamlink_timeout": 30,
+        "flaresolverr_timeout": 70,
+        "playwright_navigation_timeout": 20,
+        "fetch_timeout": 15
+    },
+    "cache": {
+        "failed_resolve_ttl": 60,
+        "youtube_cache_ttl": 1800,
+        "cache_ttl": 3600,
+        "fast_cache_ttl": 900
+    },
+    "mux": {
+        "max_processes": 4,
+        "idle_timeout": 90,
+        "ffmpeg_log_level": "warning"
+    },
+    "healthcheck": {
+        "workers": 3,
+        "scheduler_interval": 60,
+        "scheduler_min_interval": 300,
+        "flaresolverr_flag_file": "/app/flags/flaresolverr_restart.request"
+    },
+    "fallback": {
+        "cooldown": 60,
+        "threshold": 40
+    },
+    "limits": {
+        "sniffer": 3,
+        "flaresolverr": 2,
+        "probe": 2,
+        "resolver": 3
+    },
+    "logging": {
+        "level": "INFO",
+        "dir": "/app/logs",
+        "capacity": 2000,
+        "max_bytes": 5242880,
+        "backup_count": 3
+    },
+    "analytics": {
+        "enabled": false,
+        "interval": 3600,
+        "max_bytes": 10485760,
+        "backup_count": 3
+    },
+    "channels": [
+        {
+            "name": "Test1",
+            "chno": "1",
+            "group": "Test",
+            "tvgid": "test1",
+            "real_name": "Test Channel 1",
+            "streams": [
+                {
+                    "url": "https://example.com/test1.m3u8",
+                    "resolver": "direct",
+                    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
+                }
+            ],
+            "fallback": true
+        },
+        {
+            "name": "Test2",
+            "chno": "2",
+            "group": "Test",
+            "tvgid": "test2",
+            "real_name": "Test Channel 2",
+            "streams": [
+                {
+                    "url": "https://example.com/page.html",
+                    "resolver": "sniffer",
+                    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
+                },
+                {
+                    "url": "https://example.com/test2.m3u8",
+                    "resolver": "direct",
+                    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
+                }
+            ],
+            "fallback": true
+        }
+    ]
+}

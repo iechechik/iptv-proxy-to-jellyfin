@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IPTV Proxy - Логи системы</title>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --panel: #161b22;
+            --border: #30363d;
+            --text: #c9d1d9;
+            --primary: #58a6ff;
+            --danger: #f85149;
+            --warning: #d29922;
+            --info: #7ee787;
+        }
+        body {
+            background-color: var(--bg);
+            color: var(--text);
+            font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+            margin: 0;
+            padding: 15px;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            box-sizing: border-box;
+        }
+        .toolbar {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 12px;
+            align-items: center;
+            background: var(--panel);
+            padding: 10px 16px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            flex-wrap: wrap;
+        }
+        .toolbar h2 {
+            margin: 0;
+            font-family: system-ui, -apple-system, sans-serif;
+            font-size: 16px;
+            color: var(--primary);
+            margin-right: auto;
+        }
+        button, .btn-link {
+            background: #21262d;
+            color: var(--text);
+            border: 1px solid var(--border);
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            text-decoration: none;
+            font-family: system-ui, -apple-system, sans-serif;
+            font-size: 13px;
+            transition: 0.15s;
+        }
+        button:hover, .btn-link:hover {
+            background: #30363d;
+            border-color: #8b949e;
+        }
+        .btn-danger {
+            background: #da3633;
+            color: #ffffff;
+            border: none;
+        }
+        .btn-danger:hover {
+            background: #f85149;
+        }
+        label {
+            font-family: system-ui, -apple-system, sans-serif;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            user-select: none;
+        }
+        #log-container {
+            flex: 1;
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 14px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+            font-size: 13px;
+            line-height: 1.45;
+        }
+        .log-ERROR { color: var(--danger); font-weight: bold; }
+        .log-WARNING { color: var(--warning); }
+        .log-INFO { color: var(--info); }
+    </style>
+</head>
+<body>
+    <div class="toolbar">
+        <h2>📋 Системные логи</h2>
+        <label><input type="checkbox" id="autoscroll" checked> Автопрокрутка</label>
+        <label><input type="checkbox" id="autorefresh" checked> Автообновление (2с)</label>
+        <button onclick="fetchLogs()">🔄 Обновить</button>
+        <button class="btn-danger" onclick="clearLogs()">🗑️ Очистить логи</button>
+        <a href="/manage" class="btn-link">⬅ Назад в управление</a>
+    </div>
+    <div id="log-container">Загрузка логов...</div>
+
+    <script>
+        let intervalId = null;
+
+        function colorizeLine(line) {
+            let escaped = line.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            if (escaped.includes("ERROR") || escaped.includes("Traceback") || escaped.includes("Exception")) {
+                return `<span class="log-ERROR">${escaped}</span>`;
+            } else if (escaped.includes("WARNING")) {
+                return `<span class="log-WARNING">${escaped}</span>`;
+            } else if (escaped.includes("INFO")) {
+                return `<span class="log-INFO">${escaped}</span>`;
+            }
+            return escaped;
+        }
+
+        async function fetchLogs() {
+            try {
+                const res = await fetch('/logs/data');
+                const data = await res.json();
+                const container = document.getElementById('log-container');
+                
+                if (!data.logs || data.logs.length === 0) {
+                    container.innerHTML = '<em style="color:#8b949e;">Логи пусты</em>';
+                    return;
+                }
+
+                const html = data.logs.map(colorizeLine).join('\n');
+                container.innerHTML = html;
+
+                if (document.getElementById('autoscroll').checked) {
+                    container.scrollTop = container.scrollHeight;
+                }
+            } catch (err) {
+                console.error('Ошибка загрузки логов:', err);
+            }
+        }
+
+        async function clearLogs() {
+            if (confirm('Очистить локальный буфер логов?')) {
+                await fetch('/logs/clear');
+                fetchLogs();
+            }
+        }
+
+        document.getElementById('autorefresh').addEventListener('change', (e) => {
+            if (e.target.checked) {
+                startAutoRefresh();
+            } else {
+                clearInterval(intervalId);
+            }
+        });
+
+        function startAutoRefresh() {
+            clearInterval(intervalId);
+            intervalId = setInterval(fetchLogs, 2000);
+        }
+
+        fetchLogs();
+        startAutoRefresh();
+    </script>
+</body>
+</html>

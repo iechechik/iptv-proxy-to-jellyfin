@@ -1,0 +1,531 @@
+:root {
+    --bg-color: #0f1016;
+    --card-bg: #181a20;
+    --border-color: #2f333d;
+    --text-main: #f3f4f6;
+    --text-muted: #9ca3af;
+    --accent: #7c3aed;
+    --accent-hover: #6d28d9;
+    --btn-gray: #27272a;
+    --btn-gray-hover: #3f3f46;
+    --success: #10b981;
+    --success-hover: #059669;
+    --danger: #ef4444;
+    --danger-hover: #dc2626;
+}
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background-color: var(--bg-color);
+    color: var(--text-main);
+    margin: 0;
+    padding: 30px;
+}
+.container {
+    max-width: 1300px;
+    margin: 0 auto;
+}
+h1 {
+    font-size: 24px;
+    margin-bottom: 20px;
+    font-weight: 600;
+}
+.actions-bar {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 20px;
+}
+button, .btn-link {
+    background-color: var(--btn-gray);
+    color: var(--text-main);
+    border: 1px solid var(--border-color);
+    padding: 10px 16px;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    transition: background 0.2s, border-color 0.2s;
+}
+button:hover, .btn-link:hover {
+    background-color: var(--btn-gray-hover);
+    border-color: var(--text-muted);
+}
+button.btn-primary {
+    background-color: var(--accent);
+    border-color: var(--accent);
+}
+button.btn-primary:hover {
+    background-color: var(--accent-hover);
+}
+button.btn-success {
+    background-color: var(--success);
+    border-color: var(--success);
+    color: #ffffff;
+}
+button.btn-success:hover {
+    background-color: var(--success-hover);
+}
+button.btn-danger {
+    background-color: var(--danger);
+    border-color: var(--danger);
+    color: #ffffff;
+}
+button.btn-danger:hover {
+    background-color: var(--danger-hover);
+}
+.btn-sm {
+    padding: 6px 12px;
+    font-size: 13px;
+}
+.btn-fallback {
+    color: #888;
+}
+.btn-fallback.active {
+    color: #ffaa00;
+    font-weight: bold;
+    background-color: #3a3a3a;
+    border-color: #ffaa00;
+}
+#status {
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    padding: 12px 16px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+    color: var(--text-muted);
+    font-size: 14px;
+}
+table {
+    width: 100%;
+    border-collapse: collapse;
+    background-color: var(--card-bg);
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid var(--border-color);
+    margin-bottom: 20px;
+}
+th, td {
+    padding: 14px 18px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-color);
+}
+th {
+    background-color: #1f2229;
+    font-weight: 600;
+    color: var(--text-muted);
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+tr:last-child td {
+    border-bottom: none;
+}
+tr:hover td {
+    background-color: rgba(255, 255, 255, 0.02);
+}
+tr.row-fail td {
+    background-color: rgba(239, 68, 68, 0.12) !important;
+}
+tr.row-ok td {
+    background-color: rgba(16, 185, 129, 0.05) !important;
+}
+code.tvg-id {
+    background: #111318;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-family: monospace;
+    font-size: 13px;
+    color: #a78bfa;
+}
+.links-footer {
+    font-size: 14px;
+    color: var(--text-muted);
+}
+.links-footer a {
+    color: #60a5fa;
+    text-decoration: none;
+}
+.links-footer a:hover {
+    text-decoration: underline;
+}
+#toast {
+    visibility: hidden;
+    min-width: 250px;
+    background-color: #27272a;
+    color: #f3f4f6;
+    text-align: center;
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+    padding: 14px;
+    position: fixed;
+    z-index: 2000;
+    right: 30px;
+    bottom: 30px;
+    font-size: 14px;
+    box-shadow: 0 10px 15px -3px rgba(0,0,0,0.5);
+}
+#toast.show {
+    visibility: visible;
+    animation: fadein 0.3s, fadeout 0.3s 2.7s;
+}
+@keyframes fadein {
+    from {bottom: 0; opacity: 0;}
+    to {bottom: 30px; opacity: 1;}
+}
+@keyframes fadeout {
+    from {bottom: 30px; opacity: 1;}
+    to {bottom: 0; opacity: 0;}
+}
+.modal {
+    display: none;
+    position: fixed;
+    z-index: 1000;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(4px);
+}
+.modal-content {
+    background-color: var(--card-bg);
+    border: 1px solid var(--border-color);
+    margin: 5vh auto;
+    padding: 15px;
+    border-radius: 12px;
+    width: 650px;
+    max-width: 90%;
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
+    box-sizing: border-box;
+}
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+}
+.modal-header h2 {
+    font-size: 18px;
+    margin: 0;
+}
+.close {
+    color: var(--text-muted);
+    font-size: 24px;
+    font-weight: bold;
+    cursor: pointer;
+    background: none;
+    border: none;
+    padding: 0;
+}
+.close:hover {
+    color: var(--text-main);
+}
+.form-group {
+    margin-bottom: 8px;
+}
+.form-group label {
+    display: block;
+    font-size: 13px;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+}
+.form-control {
+    width: 100%;
+    background: var(--bg-color);
+    border: 1px solid var(--border-color);
+    color: var(--text-main);
+    padding: 6px 10px;
+    font-size: 13px;
+    border-radius: 8px;
+    box-sizing: border-box;
+    outline: none;
+}
+.form-control:focus {
+    border-color: var(--accent);
+}
+.search-box {
+    width: 100%;
+    background: var(--bg-color);
+    border: 1px solid var(--border-color);
+    color: var(--text-main);
+    padding: 12px 16px;
+    font-size: 15px;
+    border-radius: 8px;
+    margin-bottom: 16px;
+    box-sizing: border-box;
+    outline: none;
+}
+.search-box:focus {
+    border-color: var(--accent);
+}
+.channel-list {
+    flex-grow: 1;
+    overflow-y: auto;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background: var(--bg-color);
+    max-height: 400px;
+}
+.channel-item {
+    padding: 12px 16px;
+    cursor: pointer;
+    border-bottom: 1px solid var(--border-color);
+    font-size: 14px;
+    display: flex;
+    justify-content: space-between;
+}
+.channel-item:last-child {
+    border-bottom: none;
+}
+.channel-item:hover {
+    background-color: #27272a;
+}
+.channel-item-id {
+    color: var(--text-muted);
+    font-family: monospace;
+    font-size: 12px;
+}
+/* === Вкладки === */
+.tabs {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 20px;
+}
+.tab-link {
+    background-color: var(--btn-gray);
+    color: var(--text-main);
+    border: 1px solid var(--border-color);
+    padding: 10px 16px;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.2s, border-color 0.2s;
+}
+.tab-link:hover {
+    background-color: var(--btn-gray-hover);
+    border-color: var(--text-muted);
+}
+.tab-link.active {
+    background-color: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+}
+.tab-content {
+    display: none;
+}
+.tab-content.active {
+    display: block;
+}
+
+/* === Компактность колонок === */
+table th:nth-child(5),
+table td:nth-child(5) {
+    max-width: 100px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+table th:nth-child(7),
+table td:nth-child(7) {
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+/* Компактная таблица */
+th, td {
+    padding: 10px 12px;
+}
+
+/* Ограничиваем название канала */
+table th:nth-child(4),
+table td:nth-child(4) {
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Кнопки не переносятся */
+table td:last-child {
+    white-space: nowrap;
+    width: 1%;
+}
+
+/* ============================================================
+   Мобильная адаптация (Chrome на Android, ширина ≤ 768px)
+   Минимальный набор: контейнер на всю ширину, скрытие
+   второстепенных колонок таблицы, крупные кнопки, модалки
+   во весь экран, 16px в полях ввода (иначе Chrome зумит).
+   ============================================================ */
+@media (max-width: 768px) {
+    body {
+        padding: 12px;
+    }
+    .container {
+        max-width: 100%;
+    }
+    h1 {
+        font-size: 20px;
+        margin-bottom: 14px;
+    }
+
+    /* Вкладки — во всю ширину, равными долями */
+    .tabs {
+        gap: 6px;
+        margin-bottom: 14px;
+    }
+    .tab-link {
+        flex: 1;
+        padding: 10px 8px;
+        font-size: 13px;
+        text-align: center;
+    }
+
+    /* Панель действий — вертикально, кнопки на всю ширину */
+    .actions-bar {
+        flex-direction: column;
+        gap: 8px;
+        margin-bottom: 14px;
+    }
+    .actions-bar button,
+    .actions-bar .btn-link {
+        width: 100%;
+        justify-content: center;
+        min-height: 44px;
+        font-size: 15px;
+    }
+
+    /* Статусная строка */
+    #status {
+        padding: 10px 12px;
+        font-size: 13px;
+    }
+
+    /* Таблица каналов: горизонтальный скролл, второстепенные
+       колонки скрываются (Статус, Группа, tvg-id, Резолвер).
+       Остаются: Вкл, Номер, Название, Действия. */
+    #tab-channels {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+    table {
+        font-size: 14px;
+    }
+    th, td {
+        padding: 8px 10px;
+    }
+    table th:nth-child(2),  /* Статус */
+    table td:nth-child(2),
+    table th:nth-child(5),  /* Группа */
+    table td:nth-child(5),
+    table th:nth-child(6),  /* Резолвер */
+    table td:nth-child(6),
+    table th:nth-child(7),  /* tvg-id */
+    table td:nth-child(7) {
+        display: none;
+    }
+    /* Кнопки в строке — крупнее */
+    .btn-sm {
+        padding: 10px 12px;
+        font-size: 15px;
+        min-height: 40px;
+        min-width: 40px;
+    }
+    /* Номер канала компактнее */
+    .channel-chno {
+        width: 55px !important;
+        font-size: 14px !important;
+    }
+
+    /* Модалки — во весь экран */
+    .modal-content {
+        width: 100% !important;
+        max-width: 100% !important;
+        margin: 0 !important;
+        border-radius: 0 !important;
+        max-height: 100vh !important;
+        padding: 14px !important;
+    }
+    .modal-header h2 {
+        font-size: 16px;
+    }
+
+    /* Поля ввода: 16px — иначе Chrome зумит при фокусе */
+    .form-control,
+    input[type="text"],
+    input[type="search"],
+    select,
+    textarea {
+        font-size: 16px !important;
+        min-height: 42px;
+        padding: 8px 10px !important;
+    }
+    .search-box {
+        font-size: 16px !important;
+        padding: 10px 12px !important;
+    }
+
+    /* Кнопки в модалке — на всю ширину */
+    .modal-content > div > button {
+        min-height: 44px;
+        font-size: 15px;
+    }
+
+    /* Список EPG-каналов в модалке — выше, удобнее для пальца */
+    .channel-list {
+        max-height: 50vh;
+    }
+    .channel-item {
+        padding: 12px;
+        font-size: 15px;
+    }
+
+    /* Ссылки в футере */
+    .links-footer {
+        font-size: 13px;
+        line-height: 1.8;
+    }
+
+    /* Тосты не вылезают за экран */
+    #toast {
+        right: 12px;
+        left: 12px;
+        bottom: 12px;
+        min-width: unset;
+        font-size: 14px;
+    }
+}
+/* MUX-индикатор рядом с названием канала. */
+.mux-badge {
+    display: inline-block;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 700;
+    font-family: monospace;
+    margin-left: 6px;
+    vertical-align: middle;
+    letter-spacing: 0.5px;
+}
+.mux-badge.mux-on {
+    background: #7c3aed;
+    color: #fff;
+}
+.mux-badge.mux-req {
+    background: #27272a;
+    color: #a78bfa;
+    border: 1px solid #7c3aed;
+}
+.mux-badge.mux-off {
+    background: #1f2229;
+    color: #6b7280;
+    border: 1px solid #2f333d;
+}

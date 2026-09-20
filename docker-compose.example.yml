@@ -1,0 +1,99 @@
+# Пример docker-compose для IPTV-Proxy.
+#
+services:
+  iptv-proxy:
+    container_name: iptv-proxy
+    build: .
+    restart: unless-stopped
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
+    deploy:
+      resources:
+        limits:
+          cpus: '3.0'
+          memory: 2G
+    ports:
+      - "9098:8000"
+    volumes:
+      - ./data:/app
+      - xmltv-cache:/jellyfin-xmltv-cache #### доступ к каталогу jellyfin, в котором хранится кэш xmltv
+    environment:
+      TZ: Europe/Moscow
+      IPTV_LOG_LEVEL: info
+      IPTV_CONFIG_FILE: /app/config.json
+      IPTV_JELLYFIN_API_KEY: "твой_API_Key_Jellyfin"
+    networks:
+      - dockernet
+    depends_on:
+      - flaresolverr
+      - jellyfin
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 3G
+    tmpfs:
+      - /tmp:size=2g,mode=1777
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
+    environment:
+      - HEADLESS=true
+      - PUID=0
+      - PGID=0
+      - LOG_LEVEL=info
+      - TZ=Europe/Moscow
+    ports:
+      - "8191:8191"
+    networks:
+      - dockernet
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8191/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:latest
+    container_name: jellyfin
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+    shm_size: '5gb'
+    # Если у вас Intel iGPU и хотите аппаратное транскодирование —
+    # раскомментируйте (нужен драйвер i915 на хосте):
+    # devices:
+    #   - /dev/dri:/dev/dri
+    ports:
+      - "8096:8096"
+      - "7359:7359/udp"
+    environment:
+      - PUID=0
+      - PGID=0
+      - TZ=Europe/Moscow
+      # При необходимости задайте внешний адрес, по которому Jellyfin
+      # доступен клиентам в LAN:
+      # - JELLYFIN_PublishedServerUrl=твой_IP_addr
+      # Тюнинги для IPTV: увеличенные probesize/analyzeduration помогают
+      # Jellyfin быстрее прощупывать живые HLS-потоки.
+      - JELLYFIN_FFmpeg__probesize=1500000
+      - JELLYFIN_FFmpeg__analyzeduration=2000000
+    volumes:
+      - ./jellyfin-config:/config
+      - ./media:/data/media
+      - xmltv-cache:/jellyfin-xmltv-cache  ### каталог jellyfin, где хранится кэш - нужно обеспечить доступ iptv-proxy
+    networks:
+      - dockernet
+
+networks:
+  dockernet:
+    driver: bridge

@@ -1,0 +1,7 @@
+yt-dlp
+fastapi
+uvicorn
+jinja2
+streamlink
+playwright
+lxml

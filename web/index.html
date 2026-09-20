@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <title>IPTV Proxy — Управление</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+</head>
+<body>
+    <div class="container">
+        <h1>Управление IPTV и EPG</h1>
+
+        <!-- Вкладки -->
+        <div class="tabs">
+            <button class="tab-link active" onclick="switchTab('channels')">Каналы</button>
+            <button class="tab-link" onclick="switchTab('epg-sources')">EPG источники</button>
+            <button class="tab-link" onclick="switchTab('logs')">📋 Логи</button>
+        </div>
+
+        <!-- Панель действий для каналов -->
+        <div id="tab-channels" class="tab-content active">
+            <div class="actions-bar">
+                <button class="btn-success" onclick="saveChanges()">Сохранить изменения (с сортировкой)</button>
+                <button class="btn-primary" onclick="openAddModal()">+ Добавить канал</button>
+                <button onclick="runHealthcheckAll()" id="checkAllBtn">🔍 Проверить все каналы</button>
+                <button onclick="applyFoundResolvers()" id="applyResolversBtn" title="Применить резолверы из последней проверки">💾 Сохранить найденные методы</button>
+                <button onclick="resetResolvers()" id="resetResolversBtn" title="Установить резолвер 'auto' для всех каналов">🔄 Сбросить резолверы</button>
+                <button onclick="location.href='/epg/rebuild'">Пересобрать EPG</button>
+                <button onclick="location.href='/epg/auto-match'">Автосопоставление</button>
+                <button onclick="restartContainer()">🔴 Рестарт контейнера</button>
+            </div>
+
+            <div id="status">Загрузка статуса...</div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width: 50px;">Вкл</th>
+                        <th>Статус</th>
+                        <th style="width: 80px;">Номер</th>
+                        <th>Название</th>
+                        <th>Группа</th>
+                        <th>Резолвер</th>
+                        <th>tvg-id</th>
+                        <th style="width: 120px;">Действия</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {{ rows | safe }}
+                </tbody>
+            </table>
+
+            <div class="links-footer">
+                <a href="/m3u" target="_blank">Плейлист M3U</a> &bull;
+                <a href="/xmltv.xml.gz" target="_blank">Скачать EPG (xml.gz)</a>
+            </div>
+        </div>
+
+        <!-- Вкладка EPG источников -->
+        <div id="tab-epg-sources" class="tab-content">
+            <div class="actions-bar">
+                <button class="btn-primary" onclick="openEpgSourceModal()">+ Добавить источник</button>
+                <button onclick="updateAllEpgSources()">🔄 Обновить все базы</button>
+            </div>
+            <div id="epgSourcesTableContainer">Загрузка...</div>
+        </div>
+
+        <!-- Вкладка Логи -->
+        <div id="tab-logs" class="tab-content">
+            <div class="actions-bar">
+                <button onclick="loadLogs()">🔄 Обновить</button>
+                <button class="btn-danger" onclick="clearLogsHistory()">🗑️ Очистить логи</button>
+                <label style="margin-left: auto; display: flex; align-items: center; gap: 6px;">
+                    <input type="checkbox" id="autoscroll" checked> Автопрокрутка
+                </label>
+                <label style="display: flex; align-items: center; gap: 6px;">
+                    <input type="checkbox" id="autorefresh" checked> Автообновление
+                </label>
+            </div>
+            <div id="log-container" style="background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 8px; padding: 14px; height: 60vh; overflow-y: auto; white-space: pre-wrap; word-break: break-all; font-family: monospace; font-size: 13px;"></div>
+        </div>
+    </div>
+
+    <!-- Модальное окно канала (без потоков) -->
+    <div id="settingsModal" class="modal">
+        <div class="modal-content" style="max-height: 90vh; width: 700px; max-width: 95%;">
+            <div class="modal-header">
+                <h2 id="settingsModalTitle">Редактирование канала: <span id="settingsChannelName" style="color: #a78bfa;"></span></h2>
+                <button class="close" onclick="closeSettingsModal()">&times;</button>
+            </div>
+            <input type="hidden" id="editMode" value="edit">
+            <input type="hidden" id="editOriginalName" value="">
+
+            <div style="display: flex; gap: 16px; flex-wrap: wrap;">
+                <!-- Левая колонка: общие параметры -->
+                <div style="flex: 1; min-width: 250px;">
+                    <h3 style="margin-top: 0; font-size: 15px; color: var(--text-main); border-bottom: 1px solid var(--border-color); padding-bottom: 8px;">Общие параметры</h3>
+
+                    <div style="display: flex; gap: 10px; margin-bottom: 8px;">
+                        <div class="form-group" style="flex: 1; margin-bottom: 0;">
+                            <label>Название канала:</label>
+                            <input type="text" id="editName" class="form-control">
+                        </div>
+                        <div class="form-group" style="width: 90px; margin-bottom: 0;">
+                            <label>Номер:</label>
+                            <input type="text" id="editChno" class="form-control">
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Активный URL:</label>
+                        <input type="text" id="editActiveUrl" class="form-control" readonly style="background: #111318; color: #60a5fa; font-family: monospace;">
+                    </div>
+
+                    <div style="display: flex; gap: 10px; margin-bottom: 8px; align-items: center;">
+                        <div class="form-group" style="flex: 1; margin-bottom: 0;">
+                            <label>Активный резолвер:</label>
+                            <input type="text" id="editActiveResolver" class="form-control" readonly style="background: #111318; color: #a78bfa; font-family: monospace;">
+                        </div>
+                        <div class="form-group" style="width: 100px; margin-bottom: 0;">
+                            <label>Проба:</label>
+                            <input type="text" id="editProbeElapsed" class="form-control" readonly style="background: #111318; color: #facc15; font-family: monospace; text-align: center;">
+                        </div>
+                    </div>
+
+                    <div class="form-group" style="margin-bottom: 4px;"><label>Группа:</label><input type="text" id="editGroup" class="form-control"></div>
+                    <div class="form-group" style="margin-bottom: 4px;"><label>Logo URL:</label><input type="text" id="editLogo" class="form-control"></div>
+                    <div class="form-group" style="margin-bottom: 4px;"><label>Комментарий:</label><input type="text" id="editComment" class="form-control"></div>
+                </div>
+
+                <!-- Правая колонка: Привязка EPG -->
+                <div style="flex: 1; min-width: 250px;">
+                    <h3 style="margin-top: 0; font-size: 15px; color: var(--text-main); border-bottom: 1px solid var(--border-color); padding-bottom: 8px;">Привязка EPG</h3>
+                    <div class="form-group">
+                        <label>Выбранный EPG:</label>
+                        <div style="background: #111318; padding: 12px; border-radius: 8px; border: 1px solid var(--border-color);">
+                            <span id="currentEpgName" style="font-weight: 600; font-size: 14px;">Не выбран</span><br>
+                            <code id="currentEpgId" class="tvg-id" style="font-size: 12px; margin-top: 4px; display: inline-block;"></code>
+                        </div>
+                    </div>
+                    <div class="form-group"><input type="text" id="search" class="search-box" onkeyup="filterChannels()" placeholder="Поиск по базе EPG..."></div>
+                    <div id="channelList" class="channel-list" style="max-height: 200px; border-color: var(--border-color);"><div style="padding: 20px; text-align: center; color: var(--text-muted);">Загрузка каналов...</div></div>
+                </div>
+            </div>
+
+            <!-- Кэшированная ссылка на всю ширину -->
+            <div class="form-group" style="margin-top: 10px;">
+                <label style="display: flex; justify-content: space-between; align-items: center;">
+                    <span>Кэшированная ссылка (кликните для копирования)</span>
+                    <span id="copyStatus" style="font-size: 12px; color: var(--text-muted);">📋</span>
+                </label>
+                <input type="text" id="editCachedStream" class="form-control" readonly
+                       style="background: #111318; color: #60a5fa; cursor: pointer; font-size: 13px; font-family: monospace; width: 100%;"
+                       onclick="copyCachedStream()" title="Кликните, чтобы скопировать ссылку">
+            </div>
+
+            <div style="margin-top: 20px; border-top: 1px solid var(--border-color); padding-top: 16px; display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <button class="btn-sm" onclick="openStreamsModal()">🎬 Управление потоками</button>
+                    <button class="btn-sm" onclick="checkModalStream()">Проверить активный поток</button>
+                    <button class="btn-sm" onclick="probeChannelStream()">Проверить ffprobe</button>
+                    <button class="btn-sm" onclick="clearChannelCache()">Сбросить кэш</button>
+                </div>
+                <div>
+                    <button onclick="closeSettingsModal()">Отмена</button>
+                    <button class="btn-success" onclick="saveUnifiedSettings()">Применить изменения</button>
+                </div>
+            </div>
+            <div id="modalCheckStatus" style="margin-top: 10px; font-size: 13px; color: var(--text-muted);">Статус не проверялся</div>
+        </div>
+    </div>
+
+    <!-- Модальное окно потоков -->
+    <div id="streamsModal" class="modal">
+        <div class="modal-content" style="max-height: 85vh; width: 700px; max-width: 95%; display: flex; flex-direction: column;">
+            <div class="modal-header">
+                <h2>Потоки канала: <span id="streamsChannelName"></span></h2>
+                <button class="close" onclick="closeStreamsModal()">&times;</button>
+            </div>
+            <div id="streamsContainer" style="flex: 1 1 auto; overflow-y: auto; padding-right: 4px; margin-bottom: 10px;"></div>
+            <button class="btn-sm" onclick="addStreamField()">+ Добавить поток</button>
+            <div style="margin-top: 20px; display: flex; justify-content: flex-end; gap: 10px;">
+                <button onclick="closeStreamsModal()">Отмена</button>
+                <button class="btn-success" onclick="saveStreamsFromModal()">Сохранить потоки</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно EPG источника -->
+    <div id="epgSourceModal" class="modal">
+        <div class="modal-content" style="max-height: 85vh; width: 600px; max-width: 95%;">
+            <div class="modal-header">
+                <h2 id="epgSourceModalTitle">Добавить EPG источник</h2>
+                <button class="close" onclick="closeEpgSourceModal()">&times;</button>
+            </div>
+            <input type="hidden" id="editEpgSourceIndex" value="">
+            <div class="form-group"><label>Имя источника:</label><input type="text" id="epgSourceName" class="form-control"></div>
+            <div class="form-group"><label>URL:</label><input type="text" id="epgSourceUrl" class="form-control"></div>
+            <div class="form-group"><label>Интервал обновления:</label>
+                <select id="epgSourceInterval" class="form-control">
+                    <option value="6h">6 часов</option>
+                    <option value="12h">12 часов</option>
+                    <option value="24h">24 часа</option>
+                    <option value="48h">48 часов</option>
+                </select>
+            </div>
+            <div class="form-group"><label>Режим фильтра:</label>
+                <select id="epgSourceMode" class="form-control" onchange="toggleFilterMode()">
+                    <option value="all">Все каналы</option>
+                    <option value="whitelist">Белый список</option>
+                    <option value="blacklist">Чёрный список</option>
+                </select>
+            </div>
+            <div class="form-group"><label>Match:</label>
+                <select id="epgSourceMatch" class="form-control">
+                    <option value="any">Любое совпадение</option>
+                    <option value="all">Все совпадения</option>
+                </select>
+            </div>
+            <div class="form-group"><label>IDs (через запятую):</label><input type="text" id="epgSourceIds" class="form-control" placeholder="nbc, 1tv"></div>
+            <div class="form-group"><label>Names (через запятую):</label><input type="text" id="epgSourceNames" class="form-control" placeholder="NBC, Первый"></div>
+            <div class="form-group"><label><input type="checkbox" id="epgSourceDisable"> Отключить источник</label></div>
+            <div style="margin-top: 20px; display: flex; justify-content: space-between;">
+                <button onclick="closeEpgSourceModal()">Отмена</button>
+                <button class="btn-success" onclick="saveEpgSource()">Сохранить источник</button>
+            </div>
+        </div>
+    </div>
+    <div id="toast">Уведомление</div>
+    <script src="/static/js/common.js"></script>
+    <script src="/static/js/epg-sources.js"></script>
+    <script src="/static/js/channels.js"></script>
+    <script src="/static/js/main.js"></script>
+</body>
+</html>

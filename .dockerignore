@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.git
+.gitignore
+epg_filtered.xml.gz
+*.txt-
+*.py-
+*.py.1
+*.txt.1
