@@ -1,3 +1,61 @@
+"""
+Healthcheck: очередь + воркеры + планировщик.
+
+Архитектура:
+
+  Задача: check_channel(name, reason, force)
+    reason: scheduled | stale | webhook
+    force:  обойти recently_active (webhook)
+
+  Источники задач (все через enqueue_check):
+    Scheduler       — каналы с now >= next_check_at[name], не recently_active
+    /redirect stale — см. routers/stream.py, reason=stale
+    /redirect cold  — блокирующий resolve в хендлере, мимо очереди
+    Webhook Stop    — routers/jellyfin.py, reason=webhook, force=True
+
+  Воркер (на один канал):
+    mux жив                              -> skip
+    playing (recently_active, !force,
+             reason != stale)            -> проверить всех КРОМЕ активного,
+                                            switch НЕ делать, ждать Stop
+    иначе (не играет)                    -> проверить ВСЕ стримы,
+                                            при fallback=true выбрать лучший
+                                            и переключиться
+
+  Метод проверки одного стрима:
+    fallback=true  -> ffprobe (нужен probe_elapsed для сравнения)
+    fallback=false -> HEAD
+
+  Резолв стрима при проверке:
+    если слот имеет свежий payload (cache_expire > now) — используем его
+    без резолва. Иначе — resolve_channel_payload.
+
+  Критерий switch (services/healthcheck.py:_select_best_stream):
+    1. лучший имеет больший score, ИЛИ
+    2. score равны, активный медленнее >= fallback.switch_min_sec_active,
+       и кандидат быстрее активного на >= fallback.switch_speedup_sec
+
+  Расписание следующей проверки:
+    base = cache_ttl (success) или fast_cache_ttl (fail)
+    base = min(base, cache_expire активного - now) если известен
+    base = max(base, healthcheck.scheduler_min_interval)
+    next_check_at[name] = now + base
+
+  Ограничители (services/limits.py):
+    resolver_sem      — все резолвы (direct/yt-dlp/streamlink/sniffer/flare)
+    sniffer_sem       — внутри resolver_sem, только Chromium
+    flaresolverr_sem  — внутри resolver_sem, только FlareSolverr
+    probe_sem         — ffprobe
+
+  Используется также из:
+    services/fallback.py   — switch на живой стрим при провале /redirect
+    routers/channels.py    — ручные кнопки UI
+    routers/stream.py      — FlareSolverr-фолбэк на сегментах
+
+  run_healthcheck_async (старая обёртка) удалена. Точка входа — enqueue_check
+  или trigger_check_all (для UI-кнопки).
+"""
+
 import time
 import threading
 import concurrent.futures
@@ -5,129 +63,127 @@ import queue
 
 from core.config import (
     IPTV_DEFAULT_UA, IPTV_CACHE_TTL, IPTV_FAST_CACHE_TTL,
-    IPTV_HEALTHCHECK_MIN_INTERVAL, IPTV_HEALTHCHECK_WORKERS, IPTV_HEALTHCHECK_INTERVAL, IPTV_FALLBACK_THRESHOLD,
-    IPTV_SNIFFER_LIMIT, IPTV_FLARESOLVERR_LIMIT, IPTV_PROBE_LIMIT, IPTV_RESOLVER_LIMIT,
-    logger
+    IPTV_HEALTHCHECK_MIN_INTERVAL, IPTV_HEALTHCHECK_WORKERS,
+    IPTV_HEALTHCHECK_INTERVAL, IPTV_HEALTHCHECK_RECENTLY_ACTIVE_SEC,
+    IPTV_FALLBACK_SWITCH_MIN_SEC_ACTIVE, IPTV_FALLBACK_SWITCH_SPEEDUP_SEC,
+    logger,
 )
 import core.state as state
-from services.resolver import resolve_channel_payload, probe_stream
+from services.resolver import (
+    resolve_channel_payload, probe_stream, verify_stream_alive, parse_url_headers,
+)
 from services.events import send_broadcast_async, save_cache_and_broadcast
 from services.segment_prefetch import cleanup_expired_segments
 from services.mux_service import is_mux_alive_and_fresh
+from services.limits import (
+    resolver_sem, sniffer_sem, flaresolverr_sem, probe_sem,
+    resolve_with_semaphores,
+)
 
+# ---------------------------------------------------------------------------
 # Глобальные структуры
+# ---------------------------------------------------------------------------
+
 _executor = None
 _task_queue = queue.Queue()
 _scheduler_stop = threading.Event()
 
-_next_check_at = {}          # {channel_name: timestamp}
-_active_checks = set()       # каналы, которые сейчас проверяются
-_queued_names = set()        # каналы, ожидающие в очереди
+# {channel_name: timestamp, когда проверять}
+_next_check_at = {}
+# каналы, которые сейчас в работе (один воркер держит канал)
+_active_checks = set()
+# каналы, ожидающие в очереди (дедуп)
+_queued_names = set()
 _queue_lock = threading.Lock()
 
-# Семафоры
-_sniffer_semaphore = threading.Semaphore(IPTV_SNIFFER_LIMIT)
-_flaresolverr_semaphore = threading.Semaphore(IPTV_FLARESOLVERR_LIMIT)
-_probe_semaphore = threading.Semaphore(IPTV_PROBE_LIMIT)
-_resolver_semaphore = threading.Semaphore(IPTV_RESOLVER_LIMIT)
+# Reason'ы
+REASON_SCHEDULED = "scheduled"
+REASON_STALE = "stale"
+REASON_WEBHOOK = "webhook"
 
+
+# ---------------------------------------------------------------------------
+# Публичный API
+# ---------------------------------------------------------------------------
 
 def revalidate_channel_in_background(ch: dict):
-    """Фоновое обновление payload для активного стрима канала.
-    Пишет через state.set_stream_cache — единая точка записи в слот."""
-    name = ch["name"]
-    with state._revalidating_lock:
-        if name in state._revalidating_set:
-            return
-        state._revalidating_set.add(name)
+    """SWR: положить stale-задачу в очередь. Вызывается из /redirect.
 
-    def _worker():
-        try:
-            with state._revalidate_semaphore:
-                logger.info(f"[REVALIDATE] '{name}': background refresh started")
-                is_direct, payload, expire_time, method = resolve_channel_payload(ch)
-
-                active_idx = ch.get("active_stream_index", 0)
-                state.set_stream_cache(name, active_idx, payload, is_direct, expire_time, method)
-
-                with state.cache_lock:
-                    entry = state._epg_cache.setdefault(
-                        name, {"streams_cache": []}
-                    )
-                    streams = entry.setdefault("streams_cache", [])
-                    while len(streams) <= active_idx:
-                        streams.append({})
-                    if not isinstance(streams[active_idx], dict):
-                        streams[active_idx] = {}
-                    streams[active_idx]["last_check_detail"] = f"Background refresh via {method}"
-                    streams[active_idx]["last_checked_url"] = ch.get("url", "")
-                    streams[active_idx]["last_checked_resolver"] = ch.get("resolver", "auto")
-
-                save_cache_and_broadcast(name, {
-                    "last_check_time": time.time(),
-                    "last_check_success": True,
-                    "last_check_detail": f"Background refresh via {method}"
-                })
-                logger.info(f"[REVALIDATE] '{name}': background refresh done")
-        except Exception as e:
-            logger.warning(f"[REVALIDATE] '{name}': background refresh failed: {e}")
-        finally:
-            with state._revalidating_lock:
-                state._revalidating_set.discard(name)
-
-    threading.Thread(target=_worker, daemon=True).start()
-
-
-def _get_check_interval(ch) -> int:
-    """Верхний предел интервала между проверками канала.
-
-    Реальный интервал ограничивается оставшимся TTL кэша активного слота
-    в _process_channel_check (через min(interval, ttl)).
+    НЕ резолвит здесь и сейчас — кладёт задачу. Иначе на каждый stale-запрос
+    поднимается Chromium прямо в хендлере, что ровно та проблема, которую
+    мы лечим.
     """
-    name = ch["name"]
-    s = state.get_active_stream_state(name)
-    last_success = s.get("last_check_success")
-    if last_success is False:
-        return IPTV_FAST_CACHE_TTL
-    return IPTV_CACHE_TTL
+    enqueue_check(ch, reason=REASON_STALE, force=False)
 
 
-def _update_next_check(name: str, base_interval: int):
+def enqueue_check(ch: dict, reason: str = REASON_SCHEDULED, force: bool = False,
+                  task_id: str = None) -> bool:
+    """Кладёт канал в очередь. False — уже в очереди / в работе.
+
+    Единая точка входа для scheduler, /redirect-stale, webhook, кнопки
+    «Проверить все».
+    """
+    name = ch.get("name")
+    if not name:
+        return False
+    with _queue_lock:
+        if name in _queued_names or name in _active_checks:
+            return False
+        _queued_names.add(name)
+    _task_queue.put(("check_channel", (name, ch, task_id, reason, force)))
+    return True
+
+
+def trigger_check_all(channels: list) -> str:
+    """Кнопка «Проверить все». Создаёт task для UI, кладёт все каналы в очередь."""
+    import uuid as _uuid
+    task_id = f"check_{int(time.time())}_{_uuid.uuid4().hex[:8]}_{len(channels)}"
     with state._healthcheck_lock:
-        _next_check_at[name] = time.time() + base_interval
+        state._healthcheck_tasks[task_id] = {
+            "progress": 0,
+            "total": len(channels),
+            "results": {},
+            "done": False,
+            "complete_sent": False,
+        }
+    send_broadcast_async(event_type="healthcheck-start",
+                         extra_data={"task_id": task_id, "total": len(channels)})
 
+    queued = 0
+    for ch in channels:
+        if enqueue_check(ch, reason=REASON_SCHEDULED, force=False, task_id=task_id):
+            queued += 1
+        else:
+            # Канал уже в очереди/работе — сразу закрываем его в task,
+            # чтобы прогресс не завис.
+            _finish_task_channel(ch["name"], task_id, {
+                "success": False,
+                "detail": "Already queued or in progress",
+                "method": None,
+                "streams_results": [],
+            })
 
-def _channel_needs_check(name: str) -> bool:
+    # Если очередь оказалась пуста (все каналы уже в работе) — task надо
+    # закрыть вручную, иначе UI-спиннер зависнет.
     with state._healthcheck_lock:
-        next_at = _next_check_at.get(name)
-        if next_at is None:
-            return True
-        return time.time() >= next_at
+        task = state._healthcheck_tasks.get(task_id)
+        if task and task["progress"] >= task["total"]:
+            task["done"] = True
+            task["finished_at"] = time.time()
+            if not task.get("complete_sent"):
+                send_broadcast_async(event_type="healthcheck-complete",
+                                     extra_data={"task_id": task_id, "total": task["total"]})
+                task["complete_sent"] = True
+    return task_id
 
 
-def _worker():
-    while True:
-        try:
-            task = _task_queue.get(timeout=1.0)
-        except queue.Empty:
-            continue
-
-        if task is None:
-            break
-
-        task_type, payload = task
-        if task_type == "check_channel":
-            name, ch, task_id = payload
-            with _queue_lock:
-                _queued_names.discard(name)
-                _active_checks.add(name)
-            _process_channel_check(name, ch, task_id)
-            with _queue_lock:
-                _active_checks.discard(name)
-
+# ---------------------------------------------------------------------------
+# Внутреннее: слоты
+# ---------------------------------------------------------------------------
 
 def _ensure_slot(name: str, index: int) -> dict:
-    """Возвращает slot-словарь, создавая его при необходимости. Вызывается под cache_lock."""
+    """Возвращает slot-словарь, создавая его при необходимости.
+    Вызывать под state.cache_lock."""
     if name not in state._epg_cache or not isinstance(state._epg_cache[name], dict):
         state._epg_cache[name] = {"streams_cache": []}
     entry = state._epg_cache[name]
@@ -143,7 +199,6 @@ def _ensure_slot(name: str, index: int) -> dict:
 
 
 def _set_slot_failure(name: str, index: int, detail: str):
-    """Пишет last_check_* = False в конкретный слот."""
     with state.cache_lock:
         s = _ensure_slot(name, index)
         s["last_check_time"] = time.time()
@@ -152,7 +207,6 @@ def _set_slot_failure(name: str, index: int, detail: str):
 
 
 def _set_slot_success(name: str, index: int, detail: str):
-    """Пишет last_check_* = True в конкретный слот."""
     with state.cache_lock:
         s = _ensure_slot(name, index)
         s["last_check_time"] = time.time()
@@ -160,11 +214,12 @@ def _set_slot_success(name: str, index: int, detail: str):
         s["last_check_detail"] = detail
 
 
+# ---------------------------------------------------------------------------
+# Внутреннее: прогресс UI-задач
+# ---------------------------------------------------------------------------
+
 def _finish_task_channel(name: str, task_id: str, result: dict):
-    """Обновляет прогресс задачи и шлёт SSE-событие для одного канала.
-    Единая точка — вызывается и в нормальном потоке, и в ветках раннего
-    выхода (пропуск проверки), иначе task['done'] не выставляется и
-    UI-спиннер крутится вечно."""
+    """Закрывает канал в UI-задаче. Безопасно с task_id=None."""
     if not task_id:
         return
     with state._healthcheck_lock:
@@ -186,321 +241,401 @@ def _finish_task_channel(name: str, task_id: str, result: dict):
                                      "task_id": task_id,
                                      "progress": task["progress"],
                                      "total": task["total"],
-                                     "name": name
+                                     "name": name,
                                  })
 
 
-def _process_channel_check(name: str, ch: dict, task_id: str = None):
+# ---------------------------------------------------------------------------
+# Внутреннее: одна проверка канала
+# ---------------------------------------------------------------------------
+
+def _probe_with_semaphore(payload: str, name: str) -> dict:
+    with probe_sem:
+        return probe_stream(payload, timeout=15, channel=name)
+
+
+def _process_channel_check(name: str, ch: dict, task_id: str = None,
+                            reason: str = REASON_SCHEDULED, force: bool = False):
+    """Одна задача = один канал.
+
+    Режимы:
+      playing=False — проверяем все стримы.
+      playing=True  — проверяем всех, кроме активного (активный доказанно
+                      жив — сегменты идут). Switch не делаем, ждём Stop.
+
+    Метод проверки:
+      fallback=true  -> ffprobe (нужен probe_elapsed для сравнения).
+      fallback=false -> HEAD (один стрим, сравнивать не с чем).
+    """
     try:
-        streams = ch.get("streams", [])
+        streams = ch.get("streams", []) or []
         if not streams:
-            streams = [{
-                "url": ch.get("url"),
-                "resolver": ch.get("resolver", "auto"),
-                "ua": ch.get("ua", IPTV_DEFAULT_UA),
-                "fs_regex": ch.get("fs_regex", "")
-            }]
+            _finish_task_channel(name, task_id, {
+                "success": False, "detail": "No streams",
+                "method": None, "streams_results": [],
+            })
+            return
 
-        active_index = ch.get("active_stream_index", 0)
-        stream_results = []
-
-        with state.cache_lock:
-            last_active = state._last_active.get(name, 0)
-        recently_active = (time.time() - last_active) < 120
-
-        # Канал сейчас смотрят через мукс? Тогда probe (ffprobe 15 сек)
-        # бессмыслен: мукс сам тянет сегменты, а probe будет отбирать CPU
-        # у ffmpeg. Пропускаем проверку целиком.
+        # --- Гард: мукс жив ---
         try:
             if is_mux_alive_and_fresh(name, max_stall=30):
-                logger.info(f"[HEALTHCHECK] '{name}': playing via mux, check skipped")
+                logger.info(f"[HEALTHCHECK] '{name}': mux alive, skip")
                 _finish_task_channel(name, task_id, {
-                    "success": True,
-                    "detail": "Skipped (mux alive)",
-                    "method": None,
-                    "streams_results": []
+                    "success": True, "detail": "Skipped (mux alive)",
+                    "method": None, "streams_results": [],
                 })
                 return
         except Exception:
             pass
 
-        for s_idx, stream in enumerate(streams):
-            if stream.get("disable", False):
-                stream_results.append({"index": s_idx, "success": False, "detail": "disabled"})
+        # --- Определяем режим ---
+        with state.cache_lock:
+            last_active = state._last_active.get(name, 0)
+        recently_active = (time.time() - last_active) < IPTV_HEALTHCHECK_RECENTLY_ACTIVE_SEC
+        stale_bypasses = (reason == REASON_STALE)
+        playing = recently_active and not force and not stale_bypasses
+
+        active_index = state.get_active_index(name)
+        if not isinstance(active_index, int) or active_index < 0 or active_index >= len(streams):
+            active_index = 0
+
+        fallback_on = bool(ch.get("fallback"))
+
+        # --- Какие стримы проверяем ---
+        if playing:
+            indices_to_check = [i for i in range(len(streams)) if i != active_index]
+            logger.info(f"[HEALTHCHECK] '{name}': playing, checking {len(indices_to_check)} non-active stream(s)")
+        else:
+            indices_to_check = list(range(len(streams)))
+
+        # --- Проверка ---
+        # results_by_index[i] = {"success", "detail", "method", "probe_elapsed",
+        #                        "payload", "is_direct", "expire_time"}
+        results_by_index = {}
+
+        for i in indices_to_check:
+            s = streams[i]
+            if s.get("disable", False):
+                results_by_index[i] = {
+                    "success": False, "detail": "disabled",
+                    "method": None, "probe_elapsed": None,
+                    "payload": None, "is_direct": None, "expire_time": None,
+                }
                 continue
 
-            temp_ch = {
-                "name": name,
-                "url": stream.get("url"),
-                "resolver": stream.get("resolver", "auto"),
-                "ua": stream.get("ua", IPTV_DEFAULT_UA),
-                "fs_regex": stream.get("fs_regex", "")
-            }
+            res = _check_stream_with_cache(
+                name, s, i, use_probe=fallback_on,
+            )
+            results_by_index[i] = res
 
-            try:
-                with _resolver_semaphore:
-                    resolver = stream.get("resolver", "auto").lower()
-                    if resolver == "sniffer":
-                        with _sniffer_semaphore:
-                            is_direct, payload, expire_time, method = resolve_channel_payload(temp_ch)
-                    elif resolver == "flaresolverr_session":
-                        with _flaresolverr_semaphore:
-                            is_direct, payload, expire_time, method = resolve_channel_payload(temp_ch)
-                    else:
-                        is_direct, payload, expire_time, method = resolve_channel_payload(temp_ch)
+            if res["success"] and res["payload"]:
+                state.set_stream_cache(
+                    name, i, res["payload"], res["is_direct"],
+                    res["expire_time"], res["method"],
+                    probe_elapsed=res.get("probe_elapsed"),
+                )
+                with state.cache_lock:
+                    slot = _ensure_slot(name, i)
+                    slot["last_checked_url"] = s.get("url", "")
+                    slot["last_checked_resolver"] = s.get("resolver", "auto")
+            else:
+                _set_slot_failure(name, i, res["detail"])
 
-                result = {
-                    "index": s_idx,
-                    "success": True,
-                    "detail": f"Resolved via {method}",
-                    "method": method,
-                    "probe_elapsed": None
-                }
+        # --- Fallback / switch ---
+        if fallback_on and not playing:
+            candidates = []
+            for i, r in results_by_index.items():
+                if r.get("success") and r.get("probe_elapsed") is not None:
+                    candidates.append({
+                        "index": i,
+                        "score": 2,  # ffprobe уже отфильтровал мёртвых
+                        "probe_elapsed": r["probe_elapsed"],
+                        "method": r.get("method"),
+                    })
 
-                # Probe только для fallback-каналов, которые сейчас НЕ смотрят.
-                if ch.get("fallback") and not recently_active:
-                    try:
-                        with _probe_semaphore:
-                            probe_result = probe_stream(payload, timeout=15, channel=name)
-                        result["probe"] = probe_result
-                        if probe_result.get("ok") and "probe_elapsed" in probe_result:
-                            result["probe_elapsed"] = probe_result["probe_elapsed"]
-                            state.set_stream_cache(name, s_idx, payload, is_direct, expire_time, method,
-                                                   probe_elapsed=probe_result["probe_elapsed"])
-                        else:
-                            result["success"] = False
-                            result["detail"] = f"Probe failed: {probe_result.get('detail', 'no detail')}"
-                            state.set_stream_cache(name, s_idx, payload, is_direct, expire_time, method)
+            best = _select_best_stream(candidates, active_index)
 
-                    except Exception as e:
-                        result["probe"] = {"ok": False, "detail": str(e)}
-                        state.set_stream_cache(name, s_idx, payload, is_direct, expire_time, method)
-                else:
-                    state.set_stream_cache(name, s_idx, payload, is_direct, expire_time, method)
+            if best is not None and best != active_index:
+                logger.info(f"[HEALTHCHECK] '{name}': switch {active_index} -> {best}")
+                state.set_active_stream_index(name, best)
+                active_index = best
 
-                stream_results.append(result)
-
-            except Exception as e:
-                stream_results.append({
-                    "index": s_idx,
-                    "success": False,
-                    "detail": str(e),
-                    "method": None,
-                    "probe_elapsed": None
-                })
-                if s_idx == active_index:
-                    # Не сносим слот целиком: payload мог ещё быть валиден
-                    # (например, таймаут резолва при живом кэше). Просто
-                    # помечаем статус как failed. set_stream_cache
-                    # перезапишет слот при следующем успехе.
-                    logger.warning(
-                        f"[HEALTHCHECK] Активный стрим {s_idx} канала '{name}' "
-                        f"не зарезолвился, помечаю failed"
-                    )
-                    _set_slot_failure(name, s_idx, str(e))
-
-        # Fallback: выбрать лучший стрим на основе probe
-        if ch.get("fallback") and not recently_active:
-            switch_to = _select_best_stream(stream_results, active_index)
-            if switch_to is not None and switch_to != active_index:
-                logger.info(f"[FALLBACK] '{name}': switching stream {active_index} -> {switch_to}")
-                state.set_active_stream_index(name, switch_to)
-                active_index = switch_to
-
-        # Перечитываем активный индекс — мог поменяться после fallback.
-        # Именно по нему определяем итоговый статус канала.
-        # Источник — _active_index_map в state (обновляется set_active_stream_index).
-        idx_now = state.get_active_index(name)
-        if isinstance(idx_now, int) and idx_now >= 0:
-            active_index = idx_now
-
-        active_result = next((r for r in stream_results if r.get("index") == active_index), None)
-        active_ok = bool(active_result and active_result.get("success"))
-        active_method = active_result.get("method") if active_result else None
-
-        if active_ok:
-            detail = f"Resolved via {active_method}" if active_method else "OK"
-            _set_slot_success(name, active_index, detail)
+        # --- Финал: статус активного слота ---
+        if playing:
+            # Активный не проверялся — отметим, что пропущен, чтобы UI
+            # видел свежее время.
+            _set_slot_success(name, active_index, "Skipped (playing)")
+            active_ok = None  # статус не меняем, оставляем как было
         else:
-            detail = f"Active stream {active_index} failed"
-            _set_slot_failure(name, active_index, detail)
+            active_r = results_by_index.get(active_index)
+            active_ok = bool(active_r and active_r.get("success"))
+            if active_ok:
+                _set_slot_success(name, active_index,
+                                  f"Resolved via {active_r.get('method') or 'unknown'}")
+            else:
+                detail = (active_r or {}).get("detail") or "Active stream failed"
+                _set_slot_failure(name, active_index, detail)
 
-        # Фиксируем реальный resolver для активного стрима, если он был auto
-        if ch.get("fallback") and active_ok and active_method and active_method != "auto":
-            streams_ch = ch.get("streams", [])
-            if active_index < len(streams_ch):
-                if streams_ch[active_index].get("resolver", "auto") == "auto":
-                    logger.info(f"[FALLBACK] '{name}': pinning resolver '{active_method}' for active stream {active_index}")
-                    _fix_resolver(name, active_index, active_method)
+        # --- Прогресс UI ---
+        streams_results = []
+        for i, r in results_by_index.items():
+            streams_results.append({
+                "index": i,
+                "success": r.get("success"),
+                "detail": r.get("detail"),
+                "method": r.get("method"),
+                "probe_elapsed": r.get("probe_elapsed"),
+            })
 
-        save_cache_and_broadcast(name, {
-            "last_check_time": time.time(),
-            "last_check_success": active_ok,
-            "last_check_detail": detail
-        })
+        if playing:
+            _finish_task_channel(name, task_id, {
+                "success": True,
+                "detail": "Skipped active (playing)",
+                "method": None,
+                "streams_results": streams_results,
+            })
+        else:
+            detail = f"Active stream {active_index} " + ("OK" if active_ok else "failed")
+            _finish_task_channel(name, task_id, {
+                "success": bool(active_ok),
+                "detail": detail,
+                "method": None,
+                "streams_results": streams_results,
+            })
 
-        result = {
-            "success": active_ok,
-            "detail": detail,
-            "method": active_method,
-            "streams_results": stream_results
-        }
-
-        interval = _get_check_interval(ch)
-        s_state = state.get_active_stream_state(name)
-        cached_expire = s_state.get("cache_expire", 0)
-        if cached_expire > time.time():
-            ttl = cached_expire - time.time()
-            interval = min(interval, int(ttl))
-        # TTL — про то, когда payload невалиден; healthcheck — про то,
-        # когда проактивно идти проверять канал. Не даём короткому TTL
-        # (30 сек у sniffer) превращать планировщик в циклотрон:
-        # реактивность сохраняет get_channel_stream, который резолвит
-        # по требованию клиента. Здесь — пол, чтобы проверять не чаще,
-        # чем раз в _MIN_INTERVAL.
-        interval = max(interval, IPTV_HEALTHCHECK_MIN_INTERVAL)
-        _update_next_check(name, interval)
-
-        _finish_task_channel(name, task_id, result)
+        # --- Расписание ---
+        _schedule_next(name, success=bool(active_ok) if active_ok is not None else True)
 
     except Exception as e:
-        logger.error(f"[HEALTHCHECK] '{name}': check error: {e}")
+        logger.exception(f"[HEALTHCHECK] '{name}': check crashed")
         try:
             _finish_task_channel(name, task_id, {
-                "success": False,
-                "detail": f"Internal error: {e}",
-                "method": None,
-                "streams_results": []
+                "success": False, "detail": f"Internal error: {e}",
+                "method": None, "streams_results": [],
             })
-        except Exception as e2:
-            logger.error(f"[HEALTHCHECK] task {task_id}: failed to close: {e2}")
+        except Exception:
+            pass
 
 
-def _select_best_stream(stream_results, active_index):
-    """Выбирает лучший стрим на основе probe. Возвращает индекс для переключения или None."""
-    candidates = []
-    for res in stream_results:
-        if not res.get("success", False):
-            continue
-        probe = res.get("probe", {})
+def _check_stream_with_cache(name: str, stream: dict, index: int, use_probe: bool) -> dict:
+    """Резолвит и проверяет один стрим.
+
+    Если в слоте есть свежий payload (cache_expire > now) — используем его,
+    не резолвим. Иначе резолвим.
+
+    use_probe=True  -> после получения payload делаем ffprobe.
+    use_probe=False -> HEAD.
+
+    Возвращает dict.
+    """
+    s_idx = index
+
+    # --- Payload: кэш или резолв ---
+    cached = state.get_stream_cache(name, s_idx)
+    if cached:
+        is_direct, payload, expire_time = cached
+        method = stream.get("resolver", "auto")
+        if method == "auto":
+            method = "cache"
+    else:
+        temp_ch = {
+            "name": name,
+            "url": stream.get("url"),
+            "resolver": stream.get("resolver", "auto"),
+            "ua": stream.get("ua", IPTV_DEFAULT_UA),
+            "fs_regex": stream.get("fs_regex", ""),
+        }
+        try:
+            is_direct, payload, expire_time, method = resolve_with_semaphores(temp_ch)
+        except Exception as e:
+            return {
+                "success": False,
+                "detail": f"Resolve failed: {e}",
+                "method": None,
+                "probe_elapsed": None,
+                "payload": None, "is_direct": None, "expire_time": None,
+            }
+
+    # --- Verify ---
+    probe_elapsed = None
+    if use_probe:
+        try:
+            probe = _probe_with_semaphore(payload, name)
+        except Exception as e:
+            probe = {"ok": False, "detail": f"ffprobe raised: {e}"}
         if not probe.get("ok"):
-            continue
-        has_video = probe.get("has_video", False)
-        has_audio = probe.get("has_audio", False)
-        score = (1 if has_video else 0) + (1 if has_audio else 0)
-        probe_elapsed = res.get("probe_elapsed")
-        candidates.append({
-            "index": res["index"],
-            "score": score,
-            "probe_elapsed": probe_elapsed,
-            "method": res.get("method")
-        })
+            return {
+                "success": False,
+                "detail": f"Probe failed: {probe.get('detail', 'no detail')}",
+                "method": method,
+                "probe_elapsed": None,
+                "payload": None, "is_direct": None, "expire_time": None,
+            }
+        probe_elapsed = probe.get("probe_elapsed")
+    else:
+        try:
+            _clean, hdrs = parse_url_headers(payload)
+            ua = hdrs.get("User-Agent", IPTV_DEFAULT_UA) if isinstance(hdrs, dict) else IPTV_DEFAULT_UA
+        except Exception:
+            ua = IPTV_DEFAULT_UA
+        try:
+            ok = verify_stream_alive(payload, ua=ua)
+        except Exception:
+            ok = False
+        if not ok:
+            return {
+                "success": False,
+                "detail": "HEAD failed",
+                "method": method,
+                "probe_elapsed": None,
+                "payload": None, "is_direct": None, "expire_time": None,
+            }
 
+    return {
+        "success": True,
+        "detail": f"OK via {method}",
+        "method": method,
+        "probe_elapsed": probe_elapsed,
+        "payload": payload,
+        "is_direct": is_direct,
+        "expire_time": expire_time,
+    }
+
+
+def _select_best_stream(candidates: list, active_index: int):
+    """Выбирает лучший стрим из уже отфильтрованных кандидатов.
+
+    candidates — список dict {"index", "score", "probe_elapsed", "method"}.
+    Возвращает index лучшего или None, если switch не нужен.
+
+    Критерии switch:
+      1. Лучший кандидат имеет больший score, чем активный.
+      2. score равен, и активный медленнее >= switch_min_sec_active,
+         и кандидат быстрее активного на >= switch_speedup_sec.
+    """
     if not candidates:
         return None
 
-    candidates.sort(key=lambda x: (-x["score"], x["probe_elapsed"] if x["probe_elapsed"] is not None else float('inf')))
-
-    best = candidates[0]
+    best = min(candidates, key=lambda c: c["probe_elapsed"] if c["probe_elapsed"] is not None else float("inf"))
     current = next((c for c in candidates if c["index"] == active_index), None)
 
     if current is None:
         return best["index"]
 
+    if best["index"] == active_index:
+        return None
+
     if best["score"] > current["score"]:
         return best["index"]
-    elif best["score"] == current["score"] and best["probe_elapsed"] and current["probe_elapsed"]:
-        if current["probe_elapsed"] > 0:
-            diff_percent = (current["probe_elapsed"] - best["probe_elapsed"]) / current["probe_elapsed"] * 100
-            if diff_percent >= IPTV_FALLBACK_THRESHOLD:
-                return best["index"]
+
+    if best["score"] == current["score"]:
+        cur_el = current["probe_elapsed"]
+        best_el = best["probe_elapsed"]
+        if cur_el is None or best_el is None:
+            return None
+        if cur_el < IPTV_FALLBACK_SWITCH_MIN_SEC_ACTIVE:
+            return None
+        if (cur_el - best_el) >= IPTV_FALLBACK_SWITCH_SPEEDUP_SEC:
+            return best["index"]
 
     return None
 
 
-def _fix_resolver(name: str, stream_index: int, method: str):
-    """Обновляет resolver для конкретного стрима канала в конфиге.
+def _schedule_next(name: str, success: bool):
+    """Ставит next_check_at[name] с учётом TTL и min_interval."""
+    base = IPTV_CACHE_TTL if success else IPTV_FAST_CACHE_TTL
+    s_state = state.get_active_stream_state(name)
+    cached_expire = s_state.get("cache_expire", 0)
+    if cached_expire > time.time():
+        ttl_left = cached_expire - time.time()
+        base = min(base, ttl_left)
+    base = max(int(base), IPTV_HEALTHCHECK_MIN_INTERVAL)
+    with state._healthcheck_lock:
+        _next_check_at[name] = time.time() + base
 
-    Держим state.channels_lock на всё время операции (read-modify-write),
-    чтобы параллельная UI-операция не перетёрла нашу правку.
-    """
-    with state.channels_lock:
-        channels = state.load_channels()
-        for ch in channels:
-            if ch["name"] == name:
-                streams = ch.get("streams", [])
-                if stream_index < len(streams):
-                    streams[stream_index]["resolver"] = method
-                    if ch.get("active_stream_index") == stream_index:
-                        ch["resolver"] = method
-                state.save_channels_to_file(channels)
-                logger.info(f"[FALLBACK] '{name}': stream {stream_index} resolver set to '{method}'")
-                break
 
+# ---------------------------------------------------------------------------
+# Воркер
+# ---------------------------------------------------------------------------
+
+def _worker():
+    while True:
+        try:
+            task = _task_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        if task is None:
+            break
+        task_type, payload = task
+        if task_type != "check_channel":
+            continue
+        name, ch, task_id, reason, force = payload
+        with _queue_lock:
+            _queued_names.discard(name)
+            _active_checks.add(name)
+        try:
+            _process_channel_check(name, ch, task_id, reason=reason, force=force)
+        except Exception as e:
+            logger.exception(f"[HEALTHCHECK] worker: '{name}' crashed: {e}")
+            try:
+                _finish_task_channel(name, task_id, {
+                    "success": False, "detail": f"Worker crash: {e}",
+                    "method": None, "streams_results": [],
+                })
+            except Exception:
+                pass
+        finally:
+            with _queue_lock:
+                _active_checks.discard(name)
+
+
+# ---------------------------------------------------------------------------
+# Планировщик
+# ---------------------------------------------------------------------------
 
 def _scheduler():
+    """Раз в IPTV_HEALTHCHECK_INTERVAL секунд проходит по каналам и кладёт
+    в очередь те, кому пора (now >= next_check_at), кроме recently_active."""
     while not _scheduler_stop.is_set():
         try:
             channels = state.load_channels()
             now = time.time()
             for ch in channels:
-                name = ch["name"]
+                name = ch.get("name")
+                if not name:
+                    continue
+                if ch.get("disable", False):
+                    continue
 
-                # Если для канала сейчас работает живой мукс, который
-                # недавно отдавал данные — не трогаем его. Клиент играет
-                # через /mux/, ffmpeg сам тянет сегменты с CDN, а любой
-                # sniffer (Chromium) или probe (ffprobe) в этот момент =
-                # CPU-пик, из-за которого ffmpeg не успевает за CDN и
-                # картинка сыпется. Смерть мукса отследит mux-watchdog —
-                # когда last_data_time станет старым, is_mux_alive_and_fresh
-                # вернёт False, и канал попадёт в очередь на проверку.
+                # Мукс жив — не трогаем.
                 try:
                     if is_mux_alive_and_fresh(name, max_stall=30):
                         continue
                 except Exception:
                     pass
 
-                s_state = state.get_active_stream_state(name)
+                # recently_active — не трогаем (stale-путь и webhook пробьют).
                 with state.cache_lock:
                     last_active = state._last_active.get(name, 0)
-
-                recently_active = (now - last_active) < 60
-
-                # Пока канал смотрят — не трогаем его. Поток заведомо жив
-                # (Jellyfin тянет сегменты), а смерть во время просмотра
-                # ловится Stop-webhook'ом. Принудительно проверяем только
-                # если с последней проверки прошёл длинный TTL — на случай
-                # тихой смерти, которую webhook почему-то не поймал.
-                # Это защищает мукс-каналы от постоянных перерезолвов через
-                # sniffer: раньше короткий TTL (60 сек) заставлял планировщик
-                # запускать Chromium каждую минуту прямо во время просмотра.
-                if recently_active:
-                    last_check = s_state.get("last_check_time") or 0
-                    if (now - last_check) < IPTV_CACHE_TTL:
-                        continue
-
-                if not _channel_needs_check(name):
+                if (now - last_active) < IPTV_HEALTHCHECK_RECENTLY_ACTIVE_SEC:
                     continue
-                with _queue_lock:
-                    if name in _queued_names or name in _active_checks:
-                        continue
-                    _queued_names.add(name)
-                with state._healthcheck_lock:
-                    _next_check_at[name] = now + 10
 
-                is_sniffer = any(
-                    isinstance(s, dict) and s.get("resolver") == "sniffer"
-                    for s in ch.get("streams", [])
-                )
-                _task_queue.put(("check_channel", (name, ch, None)))
-                if is_sniffer:
-                    time.sleep(1)
-                
+                with state._healthcheck_lock:
+                    next_at = _next_check_at.get(name)
+                if next_at is not None and now < next_at:
+                    continue
+
+                enqueue_check(ch, reason=REASON_SCHEDULED, force=False)
+
             time.sleep(IPTV_HEALTHCHECK_INTERVAL)
         except Exception as e:
             logger.error(f"[HEALTHCHECK] scheduler error: {e}")
             time.sleep(10)
 
+
+# ---------------------------------------------------------------------------
+# Старт / стоп
+# ---------------------------------------------------------------------------
 
 def start_healthcheck_scheduler():
     global _executor
@@ -511,25 +646,25 @@ def start_healthcheck_scheduler():
         _executor.submit(_worker)
     threading.Thread(target=_scheduler, daemon=True).start()
 
-    # Начальный разброс для sniffer-каналов, чтобы они не стартовали
-    # одной пачкой. Каждому — сдвиг на 10 секунд от предыдущего.
+    # Стартовый разброс: first_check_at = now + i*5с.
+    # Без разброса все каналы уйдут в очередь одним залпом на первом тике.
     try:
-        sniffer_idx = 0
         now = time.time()
-        for ch in state.load_channels():
-            has_sniffer = any(
-                isinstance(s, dict) and s.get("resolver") == "sniffer"
-                for s in ch.get("streams", [])
-            )
-            if has_sniffer:
-                with state._healthcheck_lock:
-                    _next_check_at[ch["name"]] = now + sniffer_idx * 10
-                sniffer_idx += 1
-        logger.info(f"[HEALTHCHECK] sniffer stagger: {sniffer_idx} channels × 10s")
+        for i, ch in enumerate(state.load_channels()):
+            name = ch.get("name")
+            if not name:
+                continue
+            with state._healthcheck_lock:
+                _next_check_at[name] = now + i * 5
     except Exception as e:
-        logger.warning(f"[HEALTHCHECK] sniffer stagger failed: {e}")
-    
-    logger.info(f"[HEALTHCHECK] scheduler started, workers={IPTV_HEALTHCHECK_WORKERS}, interval={IPTV_HEALTHCHECK_INTERVAL}s")
+        logger.warning(f"[HEALTHCHECK] startup stagger failed: {e}")
+
+    logger.info(
+        f"[HEALTHCHECK] started: workers={IPTV_HEALTHCHECK_WORKERS}, "
+        f"interval={IPTV_HEALTHCHECK_INTERVAL}s, "
+        f"recently_active={IPTV_HEALTHCHECK_RECENTLY_ACTIVE_SEC}s, "
+        f"min_interval={IPTV_HEALTHCHECK_MIN_INTERVAL}s"
+    )
 
 
 def stop_healthcheck_scheduler():
@@ -542,81 +677,9 @@ def stop_healthcheck_scheduler():
         _executor = None
 
 
-def run_healthcheck_async(task_id: str, channels: list, send_events: bool = False):
-    total = len(channels)
-    with state._healthcheck_lock:
-        state._healthcheck_tasks[task_id] = {
-            "progress": 0,
-            "total": total,
-            "results": {},
-            "done": False,
-            "complete_sent": False
-        }
-
-    if send_events:
-        send_broadcast_async(event_type="healthcheck-start",
-                             extra_data={"task_id": task_id, "total": total})
-
-    for ch in channels:
-        name = ch["name"]
-
-        s_state = state.get_active_stream_state(name)
-        last_check = s_state.get("last_check_time")
-        if last_check and time.time() - last_check < 60:
-            with state._healthcheck_lock:
-                task = state._healthcheck_tasks[task_id]
-                task["progress"] += 1
-                task["results"][name] = {
-                    "success": s_state.get("last_check_success", False),
-                    "detail": "Skipped (recently checked)",
-                    "method": None,
-                    "streams_results": []
-                }
-                if task["progress"] >= task["total"]:
-                    task["done"] = True
-                    task["finished_at"] = time.time()
-                send_broadcast_async(event_type="healthcheck-progress",
-                                     extra_data={
-                                         "task_id": task_id,
-                                         "progress": task["progress"],
-                                         "total": task["total"],
-                                         "name": name
-                                     })
-            continue
-
-        with _queue_lock:
-            if name in _queued_names or name in _active_checks:
-                with state._healthcheck_lock:
-                    task = state._healthcheck_tasks[task_id]
-                    task["progress"] += 1
-                    task["results"][name] = {
-                        "success": False,
-                        "detail": "Already queued or in progress",
-                        "method": None,
-                        "streams_results": []
-                    }
-                    if task["progress"] >= task["total"]:
-                        task["done"] = True
-                        task["finished_at"] = time.time()
-                    send_broadcast_async(event_type="healthcheck-progress",
-                                         extra_data={
-                                             "task_id": task_id,
-                                             "progress": task["progress"],
-                                             "total": task["total"],
-                                             "name": name
-                                         })
-                continue
-            _queued_names.add(name)
-
-        _task_queue.put(("check_channel", (name, ch, task_id)))
-
-    with state._healthcheck_lock:
-        task = state._healthcheck_tasks.get(task_id)
-        if task and task.get("done") and not task.get("complete_sent"):
-            send_broadcast_async(event_type="healthcheck-complete",
-                                 extra_data={"task_id": task_id, "total": task["total"]})
-            task["complete_sent"] = True
-
+# ---------------------------------------------------------------------------
+# Совместимость со старым API
+# ---------------------------------------------------------------------------
 
 def background_cleanup():
     while True:
@@ -624,16 +687,19 @@ def background_cleanup():
         state.cleanup_expired_caches()
         cleanup_expired_segments()
 
+        # Чистим _last_active от давно неактивных имён.
         with state.cache_lock:
-            stale = [n for n, ts in state._last_active.items() if time.time() - ts > 3600]
+            stale = [n for n, ts in state._last_active.items()
+                     if time.time() - ts > 3600]
             for n in stale:
                 state._last_active.pop(n, None)
 
+        # Чистим UI-задачи старше часа.
         now = time.time()
         with state._healthcheck_lock:
             to_remove = [
-                task_id for task_id, task in state._healthcheck_tasks.items()
+                tid for tid, task in state._healthcheck_tasks.items()
                 if task.get("done") and task.get("finished_at", 0) < now - 3600
             ]
-            for task_id in to_remove:
-                state._healthcheck_tasks.pop(task_id, None)
+            for tid in to_remove:
+                state._healthcheck_tasks.pop(tid, None)

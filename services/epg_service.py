@@ -222,7 +222,7 @@ def auto_match_channels():
         state._epg_channels = epg_manager.get_channels()
 
     # Read-modify-write config.json держим в channels_lock через всю
-    # операцию. Без этого параллельный _fix_resolver из healthcheck,
+    # операцию. Без этого параллельный healthcheck,
     # UI-правка или toggle могут записать свои изменения между нашим
     # load_channels() и save_channels_to_file() — и мы перетрём их
     # своим устаревшим снимком. channels_lock — RLock, поэтому

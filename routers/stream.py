@@ -7,21 +7,39 @@ import re
 import time
 import asyncio
 import queue
+import threading
 from urllib.parse import quote, unquote, urljoin
 
 import core.state as state
 from core.config import IPTV_DEFAULT_UA, IPTV_FETCH_TIMEOUT, IPTV_FAILED_RESOLVE_TTL, logger
-from services.resolver import verify_stream_alive, parse_url_headers
+from services.resolver import parse_url_headers
 from services.proxy_service import (
     _proxy_googlevideo_manifest, _build_redirect_response, fix_hls_manifest,
     needs_mux, fetch_via_flaresolverr, read_response_text, sanitize_channel,
 )
 from services.mux_service import get_or_create_mux
 from services.fallback import try_switch_to_healthy_stream
+from services.healthcheck import revalidate_channel_in_background
 from services.events import save_cache_and_broadcast
 from services.segment_prefetch import schedule_prefetch, get_cached_segment
+from services.limits import flaresolverr_sem
 
 router = APIRouter()
+
+
+def _decode_body_gzip_aware(raw: bytes) -> str:
+    """Декодирует тело HTTP-ответа. Если body начинается с gzip magic-bytes
+    (0x1f 0x8b) — распаковывает. Некоторые CDN (ntv.ru) отдают gzip для
+    вложенных m3u8-манифестов без явного Content-Encoding: gzip.
+    TS fast-path вызывается ДО этой функции и не затрагивается.
+    """
+    if raw[:2] == b"\x1f\x8b":
+        import gzip as _gz
+        try:
+            raw = _gz.decompress(raw)
+        except Exception as _e:
+            logger.warning(f"[HLS-PROXY] gzip decompress failed: {_e}")
+    return raw.decode("utf-8", errors="ignore")
 
 # «Чёрный» манифест: 5-секундный VOD с одним сегментом.
 # Jellyfin его проигрывает и корректно останавливает сессию,
@@ -78,9 +96,15 @@ def _get_or_compute_needs_mux(name: str, payload: str, active_idx: int) -> bool:
     return flag
 
 
-def _build_stream_response(name: str, request: Request, is_direct: bool, payload: str, expire_time: float, method: str):
-    """Формирует ответ для уже полученного потока."""
-    active_idx = _get_active_index(name)
+def _build_stream_response(name: str, request: Request, is_direct: bool, payload: str, expire_time: float, method: str, active_idx: int = None):
+    """Формирует ответ для уже полученного потока.
+
+    active_idx — если известен из peek/resolve, передаём явно, чтобы
+    не перечитывать _active_index_map. Иначе читаем (гонка возможна:
+    healthcheck мог переключить активный стрим между peek и вызовом).
+    """
+    if active_idx is None:
+        active_idx = _get_active_index(name)
 
     if is_direct:
         clean_url, _ = parse_url_headers(payload)
@@ -164,6 +188,25 @@ async def redirect_channel(name: str, request: Request):
         logger.warning(f"[STREAM] '{name}': request rejected, channel disabled")
         return Response("Channel is disabled", status_code=403)
 
+    # Stale-while-revalidate: если payload есть, но TTL протух — отдаём
+    # старый НЕМЕДЛЕННО, resolve запускаем в фоне. Jellyfin никогда не
+    # ждёт sniffer (Chromium/flaresolverr = 5-7 сек), значит плеер не
+    # уходит в спиннер/треугльник. Для URL типа cdn.ntv.ru/*.m3u8?filter=
+    # сам URL не протухает — старый payload продолжает работать.
+    peek = state.peek_channel_stream(name)
+    if peek is not None and peek[3]:
+        is_direct, payload, expire_time, _ = peek
+        logger.info(f"[STREAM] '{name}': serving stale payload, revalidate in background")
+        threading.Thread(
+            target=revalidate_channel_in_background,
+            args=(ch,),
+            daemon=True,
+        ).start()
+        # active_idx берём на момент peek — тот же, что вернул payload.
+        # Если healthcheck переключит активный в фоне, /redirect всё равно
+        # уже отдаёт payload по старому индексу.
+        return _build_stream_response(name, request, is_direct, payload, expire_time, "stale", active_idx=active_idx)
+
     now = time.time()
     try:
         is_direct, payload, expire_time, method = await asyncio.wait_for(
@@ -191,34 +234,13 @@ async def redirect_channel(name: str, request: Request):
                         asyncio.to_thread(state.get_channel_stream, name),
                         timeout=30.0,
                     )
-                    return _build_stream_response(name, request, is_direct, payload, expire_time, method)
+                    return _build_stream_response(name, request, is_direct, payload, expire_time, method, active_idx=active_idx)
                 except Exception as e2:
                     logger.error(f"[STREAM] '{name}': re-resolve after fallback failed: {e2}")
 
         return _handle_stream_failure(name, active_idx, e, now)
 
-    if request.url.path.endswith('.m3u8') and not any(m in payload for m in ("wms.php", "players/", "target=")) and not await asyncio.to_thread(verify_stream_alive, payload):
-        logger.warning(f"[STREAM] '{name}': cache stale, trying fallback...")
-        if ch.get("fallback"):
-            try:
-                switched = await asyncio.to_thread(try_switch_to_healthy_stream, name)
-            except Exception as e_fb:
-                logger.error(f"[STREAM] '{name}': fallback error: {e_fb}")
-                switched = False
-
-            if switched:
-                try:
-                    is_direct, payload, expire_time, method = await asyncio.wait_for(
-                        asyncio.to_thread(state.get_channel_stream, name),
-                        timeout=30.0,
-                    )
-                    return _build_stream_response(name, request, is_direct, payload, expire_time, method)
-                except Exception as e2:
-                    logger.error(f"[STREAM] '{name}': re-resolve after fallback failed: {e2}")
-
-        return _handle_stream_failure(name, active_idx, "Кэшированный поток неживой", now)
-
-    return _build_stream_response(name, request, is_direct, payload, expire_time, method)
+    return _build_stream_response(name, request, is_direct, payload, expire_time, method, active_idx=active_idx)
 
 
 @router.get("/m3u")
@@ -262,6 +284,28 @@ def get_m3u(request: Request):
     )
 
 
+def _override_master_bandwidth(manifest_text: str, bandwidth: int = 3250000) -> str:
+    """Принудительно ставит BANDWIDTH в master-плейлист.
+    Jellyfin иначе использует дефолт ~20 Mbps и уходит в транскод.
+    Media-плейлисты (только #EXTINF + .ts) не трогает.
+    """
+    if "#EXT-X-STREAM-INF" not in manifest_text:
+        return manifest_text
+    out = []
+    for line in manifest_text.splitlines():
+        if line.startswith("#EXT-X-STREAM-INF"):
+            if "BANDWIDTH=" in line:
+                line = re.sub(r"BANDWIDTH=\d+", f"BANDWIDTH={bandwidth}", line)
+            else:
+                line = line.replace("#EXT-X-STREAM-INF:",
+                                    f"#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},", 1)
+            if "AVERAGE-BANDWIDTH=" in line:
+                line = re.sub(r"AVERAGE-BANDWIDTH=\d+",
+                              f"AVERAGE-BANDWIDTH={bandwidth}", line)
+        out.append(line)
+    return "\n".join(out)
+
+
 @router.get("/hls/manifest.m3u8")
 def proxy_hls_manifest(url: str, request: Request, referer: str = None, cookie: str = None, ua: str = None, channel: str = None):
     channel = sanitize_channel(channel, url)
@@ -275,13 +319,24 @@ def proxy_hls_manifest(url: str, request: Request, referer: str = None, cookie: 
         if cookie:
             headers["Cookie"] = unquote(cookie)
 
-        # urllib.request.urlopen сам следует редиректам и возвращает
-        # финальный ответ. Ручной цикл для 3xx был мёртвой веткой:
-        # после urlopen status уже финальный (200/4xx/5xx), не 3xx.
         req = urllib.request.Request(target_url, headers=headers)
         with urllib.request.urlopen(req, timeout=IPTV_FETCH_TIMEOUT) as resp:
             final_url = resp.geturl()
-            content = read_response_text(resp)
+            content_type = resp.headers.get("Content-Type", "") or ""
+            raw = resp.read()
+
+        # Fast path: апстрим вернул бинарный TS-сегмент вместо манифеста.
+        # Jellyfin иногда просит .ts через manifest-эндпоинт (своя логика
+        # или устаревший кэш плеера). Отдаём байты как есть — декодировать
+        # нельзя, errors='ignore' уничтожит не-ASCII содержимое видеопотока.
+        if raw[:1] == b"G" and "html" not in content_type.lower():
+            logger.info(
+                f"[HLS-PROXY] [{channel or '?'}] non-HLS served as TS "
+                f"(len={len(raw)}) target_url={target_url}"
+            )
+            return Response(content=raw, media_type="video/mp2t")
+
+        content = _decode_body_gzip_aware(raw)
 
         if not content.strip().startswith("#EXTM3U"):
             match = re.search(r'file\s*:\s*["\']([^"\']+\.m3u8[^"\']*)["\']', content)
@@ -292,10 +347,32 @@ def proxy_hls_manifest(url: str, request: Request, referer: str = None, cookie: 
                 req = urllib.request.Request(current_url, headers=headers)
                 with urllib.request.urlopen(req, timeout=IPTV_FETCH_TIMEOUT) as resp:
                     final_url = resp.geturl()
-                    content = read_response_text(resp)
+                    content_type = resp.headers.get("Content-Type", "") or ""
+                    raw2 = resp.read()
+
+                if raw2[:1] == b"G" and "html" not in content_type.lower():
+                    logger.info(
+                        f"[HLS-PROXY] [{channel or '?'}] non-HLS after extract "
+                        f"served as TS (len={len(raw2)}) target_url={target_url}"
+                    )
+                    return Response(content=raw2, media_type="video/mp2t")
+
+                content = _decode_body_gzip_aware(raw2)
+
                 if not content.strip().startswith("#EXTM3U"):
+                    logger.warning(
+                        f"[HLS-PROXY] [{channel or '?'}] non-HLS after extract "
+                        f"(ct={content_type!r}, len={len(content)}, "
+                        f"head={content[:100]!r}) target_url={target_url}"
+                    )
                     return Response("Invalid HLS manifest", status_code=502)
+
             else:
+                logger.warning(
+                    f"[HLS-PROXY] [{channel or '?'}] upstream non-HLS "
+                    f"(ct={content_type!r}, len={len(content)}, "
+                    f"head={content[:100]!r}) target_url={target_url}"
+                )
                 return Response("Not an HLS manifest", status_code=502)
 
         _no_prefetch = request.query_params.get("no_prefetch") == "1" if request else False
@@ -343,11 +420,14 @@ def proxy_hls_manifest(url: str, request: Request, referer: str = None, cookie: 
             proxy_base_url=proxy_base,
             channel=channel
         )
+        modified_m3u8 = _override_master_bandwidth(modified_m3u8)
         logger.debug(f"[HLS-PROXY] [{channel or '?'}] manifest proxied successfully: {target_url[:120]}")
+        _body = modified_m3u8.encode("utf-8")
         return Response(
-            content=modified_m3u8,
+            content=_body,
             media_type="application/vnd.apple.mpegurl",
             headers={
+                "Content-Length": str(len(_body)),
                 "Cache-Control": "no-cache, no-store, must-revalidate",
                 "Pragma": "no-cache",
                 "Expires": "0",
@@ -406,11 +486,48 @@ def proxy_hls_segment(
             with urllib.request.urlopen(req, timeout=IPTV_FETCH_TIMEOUT) as resp:
                 status_code = resp.status
                 resp_headers = resp.headers
-                data = resp.read()
+                try:
+                    data = resp.read()
+                except Exception as _read_err:
+                    partial = getattr(_read_err, "partial", None)
+                    if partial:
+                        logger.info(
+                            f"[TS-PROXY] [{channel or '?'}] incomplete read: "
+                            f"got {len(partial)} bytes, fetching remainder via Range"
+                        )
+                        data = partial
+                        # Дозапрашиваем остаток через Range. CDN tvcdnpotok
+                        # часто обрывает соединение на середине сегмента.
+                        # Без докачки Jellyfin получает обрезанный TS и
+                        # буферизует каждые 10 сек.
+                        try:
+                            h2 = dict(headers)
+                            h2["Range"] = f"bytes={len(data)}-"
+                            req2 = urllib.request.Request(target_url, headers=h2)
+                            with urllib.request.urlopen(req2, timeout=IPTV_FETCH_TIMEOUT) as resp2:
+                                try:
+                                    data += resp2.read()
+                                except Exception as _read_err2:
+                                    partial2 = getattr(_read_err2, "partial", None)
+                                    if partial2:
+                                        data += partial2
+                                    # второй обрыв — не критично, отдаём что есть
+                            logger.info(
+                                f"[TS-PROXY] [{channel or '?'}] remainder fetched, "
+                                f"total {len(data)} bytes"
+                            )
+                        except Exception as _rng_err:
+                            logger.warning(
+                                f"[TS-PROXY] [{channel or '?'}] Range fetch failed: "
+                                f"{_rng_err}, serving partial {len(data)} bytes"
+                            )
+                    else:
+                        raise
         except urllib.error.HTTPError as e:
             if e.code in (403, 404):
                 logger.info(f"[TS-PROXY] [{channel or '?'}] direct access {e.code}, FlareSolverr: {target_url[:120]}")
-                raw = fetch_via_flaresolverr(target_url, headers, IPTV_FETCH_TIMEOUT)
+                with flaresolverr_sem:
+                    raw = fetch_via_flaresolverr(target_url, headers, IPTV_FETCH_TIMEOUT)
                 elapsed = time.time() - t0
                 logger.info(f"[TS-PROXY] [{channel or '?'}] FlareSolverr: {len(raw)} bytes in {elapsed:.2f}s")
                 return Response(content=raw, media_type="video/mp2t")
@@ -433,6 +550,7 @@ def proxy_hls_segment(
             f"[TS-PROXY] [{channel or '?'}] {len(data)} bytes, status={status_code}, "
             f"in {elapsed:.2f}s: {target_url[:100]}"
         )
+        response_headers["Content-Length"] = str(len(data))
         return Response(
             content=data,
             media_type=content_type,

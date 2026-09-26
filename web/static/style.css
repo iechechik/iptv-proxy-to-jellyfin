@@ -359,150 +359,6 @@ table td:last-child {
     width: 1%;
 }
 
-/* ============================================================
-   Мобильная адаптация (Chrome на Android, ширина ≤ 768px)
-   Минимальный набор: контейнер на всю ширину, скрытие
-   второстепенных колонок таблицы, крупные кнопки, модалки
-   во весь экран, 16px в полях ввода (иначе Chrome зумит).
-   ============================================================ */
-@media (max-width: 768px) {
-    body {
-        padding: 12px;
-    }
-    .container {
-        max-width: 100%;
-    }
-    h1 {
-        font-size: 20px;
-        margin-bottom: 14px;
-    }
-
-    /* Вкладки — во всю ширину, равными долями */
-    .tabs {
-        gap: 6px;
-        margin-bottom: 14px;
-    }
-    .tab-link {
-        flex: 1;
-        padding: 10px 8px;
-        font-size: 13px;
-        text-align: center;
-    }
-
-    /* Панель действий — вертикально, кнопки на всю ширину */
-    .actions-bar {
-        flex-direction: column;
-        gap: 8px;
-        margin-bottom: 14px;
-    }
-    .actions-bar button,
-    .actions-bar .btn-link {
-        width: 100%;
-        justify-content: center;
-        min-height: 44px;
-        font-size: 15px;
-    }
-
-    /* Статусная строка */
-    #status {
-        padding: 10px 12px;
-        font-size: 13px;
-    }
-
-    /* Таблица каналов: горизонтальный скролл, второстепенные
-       колонки скрываются (Статус, Группа, tvg-id, Резолвер).
-       Остаются: Вкл, Номер, Название, Действия. */
-    #tab-channels {
-        overflow-x: auto;
-        -webkit-overflow-scrolling: touch;
-    }
-    table {
-        font-size: 14px;
-    }
-    th, td {
-        padding: 8px 10px;
-    }
-    table th:nth-child(2),  /* Статус */
-    table td:nth-child(2),
-    table th:nth-child(5),  /* Группа */
-    table td:nth-child(5),
-    table th:nth-child(6),  /* Резолвер */
-    table td:nth-child(6),
-    table th:nth-child(7),  /* tvg-id */
-    table td:nth-child(7) {
-        display: none;
-    }
-    /* Кнопки в строке — крупнее */
-    .btn-sm {
-        padding: 10px 12px;
-        font-size: 15px;
-        min-height: 40px;
-        min-width: 40px;
-    }
-    /* Номер канала компактнее */
-    .channel-chno {
-        width: 55px !important;
-        font-size: 14px !important;
-    }
-
-    /* Модалки — во весь экран */
-    .modal-content {
-        width: 100% !important;
-        max-width: 100% !important;
-        margin: 0 !important;
-        border-radius: 0 !important;
-        max-height: 100vh !important;
-        padding: 14px !important;
-    }
-    .modal-header h2 {
-        font-size: 16px;
-    }
-
-    /* Поля ввода: 16px — иначе Chrome зумит при фокусе */
-    .form-control,
-    input[type="text"],
-    input[type="search"],
-    select,
-    textarea {
-        font-size: 16px !important;
-        min-height: 42px;
-        padding: 8px 10px !important;
-    }
-    .search-box {
-        font-size: 16px !important;
-        padding: 10px 12px !important;
-    }
-
-    /* Кнопки в модалке — на всю ширину */
-    .modal-content > div > button {
-        min-height: 44px;
-        font-size: 15px;
-    }
-
-    /* Список EPG-каналов в модалке — выше, удобнее для пальца */
-    .channel-list {
-        max-height: 50vh;
-    }
-    .channel-item {
-        padding: 12px;
-        font-size: 15px;
-    }
-
-    /* Ссылки в футере */
-    .links-footer {
-        font-size: 13px;
-        line-height: 1.8;
-    }
-
-    /* Тосты не вылезают за экран */
-    #toast {
-        right: 12px;
-        left: 12px;
-        bottom: 12px;
-        min-width: unset;
-        font-size: 14px;
-    }
-}
 /* MUX-индикатор рядом с названием канала. */
 .mux-badge {
     display: inline-block;
@@ -528,4 +384,321 @@ table td:last-child {
     background: #1f2229;
     color: #6b7280;
     border: 1px solid #2f333d;
+}
+
+/* ============================================================
+   Мобильная адаптация (Chrome на Android, ширина ≤ 768px)
+   Минимальный набор: контейнер на всю ширину, скрытие
+   второстепенных колонок таблицы, крупные кнопки, модалки
+   во весь экран, 16px в полях ввода (иначе Chrome зумит).
+   ============================================================ */
+
+@media (max-width: 768px) {
+    /* --- Общее --- */
+    html, body {
+        overflow-x: hidden;
+        max-width: 100%;
+    }
+    body { padding: 10px; }
+    .container { max-width: 100%; }
+    h1 { font-size: 18px; margin-bottom: 12px; }
+
+    /* --- Вкладки --- */
+    .tabs { gap: 6px; margin-bottom: 12px; }
+    .tab-link {
+        flex: 1;
+        padding: 10px 4px;
+        font-size: 12px;
+        text-align: center;
+        min-width: 0;
+        white-space: normal;
+        word-break: break-word;
+    }
+
+    /* --- Панель действий: 2 в ряд --- */
+    .actions-bar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 12px;
+    }
+    .actions-bar button,
+    .actions-bar .btn-link {
+        flex: 1 1 calc(50% - 4px);
+        min-width: 0;
+        min-height: 42px;
+        padding: 6px 8px;
+        font-size: 12px;
+        line-height: 1.2;
+        text-align: center;
+        white-space: normal;
+        word-break: break-word;
+        justify-content: center;
+    }
+
+    #status {
+        padding: 8px 10px;
+        font-size: 12px;
+        word-break: break-word;
+    }
+
+    /* --- Таблица → карточки через Grid --- */
+    #tab-channels {
+        overflow-x: hidden;
+        max-width: 100%;
+    }
+    table thead { display: none; }
+    table, table tbody { display: block; width: 100%; }
+    table {
+        background: transparent;
+        border: none;
+        border-radius: 0;
+        margin-bottom: 0;
+    }
+    table tr {
+        display: grid;
+        grid-template-columns: 30px 1fr 60px;
+        grid-template-areas:
+            "chk  status chno"
+            "name name   name"
+            "act  act    act";
+        gap: 8px;
+        margin-bottom: 10px;
+        padding: 12px;
+        border: 1px solid var(--border-color);
+        border-radius: 10px;
+        background: var(--card-bg);
+        box-sizing: border-box;
+        width: 100%;
+    }
+    table tr:last-child { margin-bottom: 0; }
+    table tr:hover td { background: transparent; }
+    table td {
+        display: block;
+        border: none;
+        padding: 0;
+        max-width: 100%;
+        min-width: 0;
+        overflow-wrap: break-word;
+        word-break: break-word;
+        white-space: normal;
+        text-overflow: clip;
+        box-sizing: border-box;
+    }
+
+    /* Чекбокс */
+    table td:nth-child(1) {
+        grid-area: chk;
+        align-self: center;
+    }
+    table td:nth-child(1) input[type="checkbox"] {
+        width: 22px;
+        height: 22px;
+        cursor: pointer;
+        display: block;
+        margin: 0;
+    }
+
+    /* Статус (дата проверки) */
+    table td:nth-child(2) {
+        grid-area: status;
+        font-size: 12px;
+        color: var(--text-muted);
+        align-self: center;
+    }
+
+    /* Номер */
+    table td:nth-child(3) {
+        grid-area: chno;
+        align-self: center;
+    }
+    .channel-chno {
+        width: 100% !important;
+        box-sizing: border-box;
+        font-size: 13px !important;
+        padding: 6px 4px !important;
+        text-align: center;
+        min-width: 0;
+    }
+
+    /* Имя канала */
+    table td:nth-child(4) {
+        grid-area: name;
+        font-size: 16px;
+        line-height: 1.3;
+        padding-top: 2px;
+    }
+
+    /* Скрываем группу, резолвер, tvg-id */
+    table td:nth-child(5),
+    table td:nth-child(6),
+    table td:nth-child(7) {
+        display: none;
+    }
+
+    /* Кнопки внизу карточки — три равные колонки */
+    table td:nth-child(8) {
+        grid-area: act;
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 8px;
+        margin-top: 6px;
+        padding-top: 10px;
+        border-top: 1px solid var(--border-color);
+        width: 100%;
+        box-sizing: border-box;
+    }
+    table td:nth-child(8) .btn-sm {
+        width: 100%;
+        min-width: 0;
+        max-width: none;
+        min-height: 42px;
+        font-size: 15px;
+        padding: 6px;
+        box-sizing: border-box;
+    }
+
+    /* ============================================================
+       МОДАЛКИ
+       ============================================================ */
+    .modal-content {
+        width: 100% !important;
+        max-width: 100% !important;
+        margin: 0 !important;
+        border-radius: 0 !important;
+        height: 100vh !important;
+        max-height: 100vh !important;
+        padding: 10px !important;
+        box-sizing: border-box;
+        overflow-y: auto;
+        overflow-x: hidden;
+        display: flex;
+        flex-direction: column;
+        -webkit-overflow-scrolling: touch;
+    }
+    .modal-header {
+        flex: 0 0 auto;
+        position: sticky;
+        top: 0;
+        background: var(--card-bg);
+        padding-bottom: 8px;
+        z-index: 10;
+        border-bottom: 1px solid var(--border-color);
+        margin-bottom: 12px;
+    }
+    .modal-header h2 {
+        font-size: 15px;
+        margin: 0;
+        word-break: break-word;
+    }
+
+    /* Две колонки формы (Общие / EPG) → в одну */
+    #settingsModal .modal-content > div[style*="gap: 16px"] {
+        flex-direction: column !important;
+        gap: 0 !important;
+    }
+    #settingsModal .modal-content > div[style*="gap: 16px"] > div[style*="min-width: 250px"] {
+        min-width: 0 !important;
+        flex: 0 0 auto !important;
+    }
+
+    /* Скрываем Группу, Logo, Комментарий (по id input'а) */
+    .form-group:has(#editGroup),
+    .form-group:has(#editLogo),
+    .form-group:has(#editComment) {
+        display: none !important;
+    }
+
+    /* Нижний блок кнопок: sticky снизу, чтобы всегда был виден */
+    #settingsModal .modal-content > div[style*="justify-content: space-between"] {
+        position: sticky;
+        bottom: 0;
+        background: var(--card-bg);
+        margin-top: 12px;
+        padding: 10px 0;
+        border-top: 1px solid var(--border-color);
+        z-index: 10;
+        flex-direction: column !important;
+        align-items: stretch !important;
+        gap: 8px;
+    }
+    #settingsModal .modal-content > div[style*="justify-content: space-between"] > div {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        width: 100%;
+    }
+    #settingsModal .modal-content > div[style*="justify-content: space-between"] > div > button {
+        width: 100%;
+    }
+
+    /* Скрываем три кнопки проверок, оставляем "Управление потоками" */
+    #settingsModal .modal-content > div[style*="justify-content: space-between"] > div:first-child > button:not(:first-child) {
+        display: none !important;
+    }
+
+    /* Компактнее поля в модалке */
+    .modal-content .form-group {
+        margin-bottom: 6px;
+    }
+
+    /* Кнопки в модалке */
+    .modal-content button {
+        min-height: 42px;
+        font-size: 13px;
+        padding: 8px 10px;
+        white-space: normal;
+        word-break: break-word;
+    }
+    .modal-content .btn-sm {
+        min-height: 42px;
+        font-size: 14px;
+    }
+
+    /* Поля ввода 16px — иначе Chrome зумит при фокусе */
+    .form-control,
+    input[type="text"],
+    input[type="search"],
+    select,
+    textarea {
+        font-size: 16px !important;
+        min-height: 38px;
+        padding: 6px 10px !important;
+        box-sizing: border-box;
+        max-width: 100%;
+    }
+
+    /* Список EPG-каналов */
+    .channel-list {
+        max-height: 40vh;
+        min-height: 150px;
+    }
+    .channel-item { padding: 10px 12px; font-size: 14px; }
+
+    .search-box {
+        font-size: 16px !important;
+        padding: 8px 10px !important;
+        margin-bottom: 10px;
+    }
+
+    .links-footer { font-size: 12px; line-height: 1.7; }
+
+    #toast {
+        right: 10px;
+        left: 10px;
+        bottom: 10px;
+        min-width: unset;
+        font-size: 13px;
+        padding: 10px;
+    }
+
+    /* Модалка потоков */
+    #streamsModal .modal-content {
+        overflow-y: hidden;
+    }
+    #streamsContainer {
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
+        flex: 1 1 auto;
+    }
 }

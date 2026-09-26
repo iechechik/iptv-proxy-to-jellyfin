@@ -254,7 +254,20 @@ def _compute_cache_expire(payload: str, method: str, cache_control: str | None =
     #    Доверяем, но не больше cap'а: для sniffer — 600, для остальных — default.
     if cache_control is not None:
         cap = _SNIFFER_HEAD_CAP if method == "sniffer" else default_ttl
-        return time.time() + _parse_cache_control_ttl(cache_control, cap)
+        ttl = _parse_cache_control_ttl(cache_control, cap)
+        # Sniffer и «max-age=0 / no-cache» от CDN: это директива
+        # «перепроверяй при каждом запросе», а не «URL сдох через 0 сек».
+        # Мы только что перепроверили через Chromium и получили свежие
+        # URL+куки. Гонять Chromium каждые 30 секунд дорого: пока он
+        # работает, /redirect висит 5-7 сек, Jellyfin ждёт манифест,
+        # буфер пустеет — плеер залипает (спиннер/треугльник/спиннер).
+        # Если в самом URL нет expire=/token=/session=, поднимаем пол
+        # до _SNIFFER_NO_INFO_TTL (180 сек).
+        if method == "sniffer" and ttl < _SNIFFER_NO_INFO_TTL:
+            clean_url, _ = parse_url_headers(payload)
+            if _extract_url_expiry(clean_url) is None and not _is_session_url(clean_url):
+                ttl = _SNIFFER_NO_INFO_TTL
+        return time.time() + ttl
 
     # 3) Session URL — спрашиваем CDN, но жёстко ограничиваем сверху.
     #    Подписанные ссылки (token=, .php, wmsauthsign=) живут короче.
@@ -811,6 +824,9 @@ def verify_stream_alive(payload: str, ua: str = IPTV_DEFAULT_UA) -> bool:
 
     if referer:
         headers["Referer"] = referer
+    cookie = headers_dict.get("Cookie", "")
+    if cookie:
+        headers["Cookie"] = cookie
 
     if "googlevideo.com" in clean_url:
         headers.setdefault("Referer", "https://www.youtube.com/")

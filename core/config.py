@@ -82,96 +82,12 @@ def backup_file(file_path: str) -> None:
         except Exception as e:
             logger.error(f"[CONFIG] backup failed: {e}")
 
-# ---------- Дефолтные значения ----------
-DEFAULT_CONFIG = {
-    "epg": {
-        "sources": [],
-        "update_time": "",
-        "cache_path": "epg_filtered.xml.gz",
-        "db_file": "epg.db",
-        "download_timeout": 60,
-        "head_timeout": 10,
-    },
-    "server": {
-        "host": "0.0.0.0",
-        "port": 8000,
-        "manage_url": "http://iptv-proxy:8000",
-        "override_file": "config.override.json",
-    },
-    "jellyfin": {
-        "url": "http://jellyfin:8096",
-        "api_key": "",
-        "xmltv_cache_dir": "/jellyfin-xmltv-cache",
-        "api_timeout": 15,
-    },
-    "resolver": {
-        "default_ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
-        "playwright_chromium": "/usr/bin/chromium",
-        "flaresolverr_url": "http://flaresolverr:8191/v1",
-        "order": [
-            "direct",
-            "yt-dlp",
-            "streamlink",
-            "flaresolverr_simple",
-            "flaresolverr_session",
-            "sniffer",
-        ],
-        "fast_check_resolvers": ["sniffer", "flaresolverr_session"],
-        "streamlink_timeout": 30,
-        "flaresolverr_timeout": 70,
-        "playwright_navigation_timeout": 20,
-        "fetch_timeout": 15,
-    },
-    "cache": {
-        "failed_resolve_ttl": 60,
-        "youtube_cache_ttl": 1800,
-        "cache_ttl": 3600,
-        "fast_cache_ttl": 600,
-    },
-    "mux": {
-        "max_processes": 5,
-        "idle_timeout": 30,
-        "ffmpeg_log_level": "error",
-    },
-    "healthcheck": {
-        "workers": 5,
-        "scheduler_interval": 30,
-        # Путь к flag-файлу, который resolver.py ставит при ошибке
-        # FlareSolverr. Host-скрипт видит файл и рестартует flare.
-        # Пусто — механизм выключен, flare вызывается как раньше.
-        "flaresolverr_flag_file": "",
-    },
-    "fallback": {
-        "cooldown": 120,
-        "threshold": 50,
-    },
-    "limits": {
-        "sniffer": 5,
-        "flaresolverr": 5,
-        "probe": 3,
-        "resolver": 5,
-    },
-    "logging": {
-        "level": "info",
-        "dir": "/app/logs",
-        "capacity": 2000,
-        "max_bytes": 5242880,
-        "backup_count": 3,
-    },
-    "analytics": {
-        "enabled": False,
-        "interval": 3600,
-    },
-    "channels": [],
-}
-
 # ---------- Глобальные переменные ----------
 CONFIG_FILE = os.getenv("IPTV_CONFIG_FILE", "config.json")
 IPTV_OVERRIDE_FILE = os.getenv("IPTV_OVERRIDE_FILE", "config.override.json")
 CONFIG_ERROR = None
 
 IPTV_MANAGE_URL = os.getenv("IPTV_MANAGE_URL", "http://iptv-proxy:8000")
-IPTV_STARTUP_FILE = os.getenv("IPTV_STARTUP_FILE", "channels.txt")
 IPTV_BACKUP_FILE = os.getenv("IPTV_BACKUP_FILE", "channels.save")
 IPTV_CACHE_FILE = os.getenv("IPTV_CACHE_FILE", "cache.json")
 
@@ -220,12 +136,14 @@ IPTV_HEALTHCHECK_WORKERS = int(os.getenv("IPTV_HEALTHCHECK_WORKERS", "10"))
 IPTV_HEALTHCHECK_INTERVAL = int(os.getenv("IPTV_HEALTHCHECK_INTERVAL", "30"))
 IPTV_HEALTHCHECK_MIN_INTERVAL = int(os.getenv("IPTV_HEALTHCHECK_MIN_INTERVAL", "300"))
 IPTV_HEALTHCHECK_FLARESOLVERR_FLAG_FILE = os.getenv("IPTV_HEALTHCHECK_FLARESOLVERR_FLAG_FILE", "")
+IPTV_HEALTHCHECK_RECENTLY_ACTIVE_SEC = int(os.getenv("IPTV_HEALTHCHECK_RECENTLY_ACTIVE_SEC", "120"))
 IPTV_FALLBACK_COOLDOWN = int(os.getenv("IPTV_FALLBACK_COOLDOWN", "120"))
-IPTV_FALLBACK_THRESHOLD = int(os.getenv("IPTV_FALLBACK_THRESHOLD", "50"))
+IPTV_FALLBACK_SWITCH_MIN_SEC_ACTIVE = float(os.getenv("IPTV_FALLBACK_SWITCH_MIN_SEC_ACTIVE", "3.0"))
+IPTV_FALLBACK_SWITCH_SPEEDUP_SEC = float(os.getenv("IPTV_FALLBACK_SWITCH_SPEEDUP_SEC", "1.0"))
 
 IPTV_SNIFFER_LIMIT = int(os.getenv("IPTV_SNIFFER_LIMIT", "5"))
 IPTV_FLARESOLVERR_LIMIT = int(os.getenv("IPTV_FLARESOLVERR_LIMIT", "5"))
-IPTV_PROBE_LIMIT = int(os.getenv("IPTV_PROBE_LIMIT", "3"))
+IPTV_PROBE_LIMIT = int(os.getenv("IPTV_PROBE_LIMIT", "2"))
 IPTV_RESOLVER_LIMIT = int(os.getenv("IPTV_RESOLVER_LIMIT", "5"))
 
 # --- Prefetch ---
@@ -402,8 +320,12 @@ if CONFIG_DATA:
     IPTV_HEALTHCHECK_FLARESOLVERR_FLAG_FILE = get_config_value(
         "healthcheck", "flaresolverr_flag_file", IPTV_HEALTHCHECK_FLARESOLVERR_FLAG_FILE
     )
-    IPTV_FALLBACK_COOLDOWN =  get_config_value("fallback", "cooldown", IPTV_FALLBACK_COOLDOWN)
-    IPTV_FALLBACK_THRESHOLD =  get_config_value("fallback", "threshold", IPTV_FALLBACK_THRESHOLD)
+    IPTV_HEALTHCHECK_RECENTLY_ACTIVE_SEC = get_config_value(
+        "healthcheck", "recently_active_sec", IPTV_HEALTHCHECK_RECENTLY_ACTIVE_SEC
+    )
+    IPTV_FALLBACK_COOLDOWN = get_config_value("fallback", "cooldown", IPTV_FALLBACK_COOLDOWN)
+    IPTV_FALLBACK_SWITCH_MIN_SEC_ACTIVE = get_config_value("fallback", "switch_min_sec_active", IPTV_FALLBACK_SWITCH_MIN_SEC_ACTIVE)
+    IPTV_FALLBACK_SWITCH_SPEEDUP_SEC = get_config_value("fallback", "switch_speedup_sec", IPTV_FALLBACK_SWITCH_SPEEDUP_SEC)
 
     IPTV_SNIFFER_LIMIT = get_config_value("limits", "sniffer", IPTV_SNIFFER_LIMIT)
     IPTV_FLARESOLVERR_LIMIT = get_config_value("limits", "flaresolverr", IPTV_FLARESOLVERR_LIMIT)
@@ -687,11 +609,13 @@ def save_full_config(channels: list = None) -> bool:
         "workers": IPTV_HEALTHCHECK_WORKERS,
         "scheduler_interval": IPTV_HEALTHCHECK_INTERVAL,
         "scheduler_min_interval": IPTV_HEALTHCHECK_MIN_INTERVAL,
+        "recently_active_sec": IPTV_HEALTHCHECK_RECENTLY_ACTIVE_SEC,
         "flaresolverr_flag_file": IPTV_HEALTHCHECK_FLARESOLVERR_FLAG_FILE,
     }
     CONFIG_DATA["fallback"] = {
         "cooldown": IPTV_FALLBACK_COOLDOWN,
-        "threshold": IPTV_FALLBACK_THRESHOLD,
+        "switch_min_sec_active": IPTV_FALLBACK_SWITCH_MIN_SEC_ACTIVE,
+        "switch_speedup_sec": IPTV_FALLBACK_SWITCH_SPEEDUP_SEC,
     }
     CONFIG_DATA["limits"] = {
         "sniffer": IPTV_SNIFFER_LIMIT,
@@ -795,11 +719,12 @@ def save_full_config(channels: list = None) -> bool:
     }
 
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        tmp = CONFIG_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(ordered_config, f, ensure_ascii=False, indent=4)
+        os.replace(tmp, CONFIG_FILE)
         logger.info(f"[CONFIG] full config saved to {CONFIG_FILE}")
         return True
     except Exception as e:
         logger.exception(f"[CONFIG] config.json save failed: {e}")
         return False
-

@@ -3,12 +3,12 @@ from fastapi.responses import JSONResponse
 import asyncio
 import re
 import time
-import threading
 
 import core.state as state
 from core.config import IPTV_DEFAULT_UA, logger
-from services.resolver import resolve_channel_payload, is_valid_resolver, probe_stream
-from services.healthcheck import run_healthcheck_async
+from services.resolver import is_valid_resolver, probe_stream
+from services.limits import resolve_with_semaphores, probe_sem
+from services.healthcheck import trigger_check_all
 from services.events import send_broadcast_async
 from services.epg_service import epg_manager
 
@@ -17,7 +17,7 @@ router = APIRouter()
 # Замечание по блокировкам:
 # Везде, где происходит «прочитать каналы → изменить в памяти → сохранить»,
 # мы держим state.channels_lock через всю операцию. Без этого параллельный
-# вызов (UI + healthcheck _fix_resolver + scheduler) мог перетереть изменения
+# вызов (UI + healthcheck + scheduler) мог перетереть изменения
 # по принципу last-write-wins. state.channels_lock — RLock, поэтому
 # load_channels() и save_channels_to_file() внутри критической секции
 # срабатывают рекурсивно, без самоблокировки.
@@ -29,17 +29,8 @@ def start_healthcheck():
     if not channels:
         return JSONResponse({"success": False, "error": "Нет каналов для проверки"})
 
-    task_id = f"check_{int(time.time())}_{len(channels)}"
-    with state._healthcheck_lock:
-        state._healthcheck_tasks[task_id] = {
-            "progress": 0,
-            "total": len(channels),
-            "results": {},
-            "done": False
-        }
-
-    thread = threading.Thread(target=run_healthcheck_async, args=(task_id, channels, True), daemon=True)
-    thread.start()
+    # trigger_check_all сам создаёт task, шлёт SSE, кладёт каналы в очередь.
+    task_id = trigger_check_all(channels)
     return JSONResponse({"success": True, "task_id": task_id})
 
 
@@ -118,7 +109,7 @@ async def check_single_stream(request: Request):
         logger.info(f"[HEALTHCHECK] checking: {url}")
         ch = {"name": name or "temp", "url": url, "ua": ua, "fs_regex": fs_regex, "resolver": resolver}
         try:
-            is_direct, payload, expire_time, method = resolve_channel_payload(ch)
+            is_direct, payload, expire_time, method = resolve_with_semaphores(ch)
             probe_elapsed = None
 
             if name:
@@ -263,8 +254,9 @@ async def probe_channel_stream(request: Request):
             }
 
             def _resolve_and_probe_url():
-                is_direct, payload, expire_time, method = resolve_channel_payload(ch)
-                probe_result = probe_stream(payload, channel=name)
+                is_direct, payload, expire_time, method = resolve_with_semaphores(ch)
+                with probe_sem:
+                    probe_result = probe_stream(payload, channel=name)
                 return is_direct, payload, expire_time, method, probe_result
 
             is_direct, payload, expire_time, method, probe_result = await asyncio.to_thread(_resolve_and_probe_url)
@@ -401,7 +393,7 @@ async def check_stream_mux(request: Request):
               "fs_regex": fs_regex, "resolver": resolver}
 
         def _work():
-            is_direct, payload, expire_time, method = resolve_channel_payload(ch)
+            is_direct, payload, expire_time, method = resolve_with_semaphores(ch)
             from services.proxy_service import needs_mux as _nm
             needs_mux_flag = _nm(payload, channel_name=name)
             return is_direct, payload, expire_time, method, needs_mux_flag

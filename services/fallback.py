@@ -2,7 +2,8 @@ import time
 import threading
 import core.state as state
 from core.config import logger, IPTV_FALLBACK_COOLDOWN
-from services.resolver import resolve_channel_payload, probe_stream
+from services.resolver import probe_stream
+from services.limits import resolve_with_semaphores, probe_sem
 from services.events import send_broadcast_async
 
 _fallback_last_switch_ts = {}
@@ -46,7 +47,8 @@ def try_switch_to_healthy_stream(name: str) -> bool:
                 # get_stream_cache уже отсеивает протухшие записи,
                 # повторная проверка expire_time здесь излишняя.
                 try:
-                    probe_result = probe_stream(payload, timeout=15, channel=name)
+                    with probe_sem:
+                        probe_result = probe_stream(payload, timeout=15, channel=name)
                 except Exception as e:
                     logger.warning(f"[FALLBACK] '{name}': probe from cache failed idx={idx}: {e}")
                     probe_result = {"ok": False}
@@ -69,13 +71,14 @@ def try_switch_to_healthy_stream(name: str) -> bool:
                         "ua": stream.get("ua", ""),
                         "fs_regex": stream.get("fs_regex", "")
                     }
-                    is_direct, payload, expire_time, method = resolve_channel_payload(temp_ch)
+                    is_direct, payload, expire_time, method = resolve_with_semaphores(temp_ch)
                 except Exception as e:
                     logger.warning(f"[FALLBACK] '{name}': resolve failed idx={idx}: {e}")
                     continue
 
                 try:
-                    probe_result = probe_stream(payload, timeout=15, channel=name)
+                    with probe_sem:
+                        probe_result = probe_stream(payload, timeout=15, channel=name)
                 except Exception as e:
                     logger.warning(f"[FALLBACK] '{name}': probe after resolve failed idx={idx}: {e}")
                     continue

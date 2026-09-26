@@ -1,11 +1,9 @@
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-import threading
-import time
 
 import core.state as state
 from core.config import logger
-from services.healthcheck import run_healthcheck_async
+from services.healthcheck import enqueue_check, REASON_WEBHOOK
 
 router = APIRouter()
 
@@ -57,24 +55,15 @@ async def jellyfin_webhook(request: Request):
             logger.info(f"[WEBHOOK] '{channel_name}': Stop event, fallback disabled, skipping")
             return JSONResponse({"success": True, "message": "fallback disabled"})
 
-        # Дедупликация: не запускаем healthcheck, если для этого канала
-        # уже есть незавершённая webhook-задача.
-        with state._healthcheck_lock:
-            for tid, task in state._healthcheck_tasks.items():
-                if task.get("done"):
-                    continue
-                if tid.startswith("webhook_") and ch["name"] in tid:
-                    logger.info(f"[WEBHOOK] '{channel_name}': task already queued ({tid}), skipping")
-                    return JSONResponse({"success": True, "message": "already queued"})
-
-        logger.info(f"[WEBHOOK] '{channel_name}': Stop event, starting background healthcheck")
-
-        task_id = f"webhook_{int(time.time())}_{ch['name']}"
-        threading.Thread(
-            target=run_healthcheck_async,
-            args=(task_id, [ch], False),
-            daemon=True
-        ).start()
+        # Кладём задачу в очередь healthcheck. force=True пробьёт recently_active
+        # (Stop пришёл — значит клиент только что отвалился, но _last_active
+        # обновлён секунды назад последним /redirect).
+        # Дедуп — по имени канала в enqueue_check.
+        queued = enqueue_check(ch, reason=REASON_WEBHOOK, force=True)
+        if queued:
+            logger.info(f"[WEBHOOK] '{channel_name}': Stop event, queued for check")
+        else:
+            logger.info(f"[WEBHOOK] '{channel_name}': Stop event, already queued")
 
         return JSONResponse({"success": True})
 

@@ -53,10 +53,6 @@ _channels_memory = []
 _epg_lock = threading.Lock()           # для build_filtered_epg
 _epg_building = False
 
-_revalidating_set = set()
-_revalidating_lock = threading.Lock()
-_revalidate_semaphore = threading.Semaphore(5)
-
 _failed_resolve_cache = {}
 _last_active = {}   # {channel_name: timestamp последнего запроса от клиента}
 
@@ -178,62 +174,6 @@ def assign_stream_ids(streams: list) -> None:
             sid = secrets.randbits(52)
         s["stream_id"] = sid
         seen.add(sid)
-
-
-def convert_legacy_to_channels(legacy_text: str) -> list:
-    channels = []
-    default_chno = 101
-    for line in legacy_text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split("|")
-        if len(parts) >= 2:
-            name = parts[0].strip()
-            url = parts[1].strip()
-            if len(parts) >= 8 or (len(parts) >= 3 and parts[2].strip().isdigit()):
-                chno = parts[2].strip() if len(parts) > 2 and parts[2].strip() else ""
-                group = parts[3].strip() if len(parts) > 3 else ""
-                logo = parts[4].strip() if len(parts) > 4 else ""
-                tvgid = parts[5].strip() if len(parts) > 5 else ""
-                ua = parts[6].strip() if len(parts) > 6 else IPTV_DEFAULT_UA
-                fs_regex = parts[7].strip() if len(parts) > 7 else ""
-                resolver = parts[8].strip().lower() if len(parts) > 8 else "auto"
-            else:
-                chno = ""
-                group = parts[2].strip() if len(parts) > 2 else ""
-                logo = parts[3].strip() if len(parts) > 3 else ""
-                tvgid = parts[4].strip() if len(parts) > 4 else ""
-                ua = parts[5].strip() if len(parts) > 5 else IPTV_DEFAULT_UA
-                fs_regex = parts[6].strip() if len(parts) > 6 else ""
-                resolver = "auto"
-
-            if not chno:
-                chno = str(default_chno)
-                default_chno += 1
-            else:
-                try:
-                    default_chno = max(default_chno, int(chno) + 1)
-                except (ValueError, TypeError):
-                    pass
-
-            channels.append({
-                "name": name,
-                "chno": str(chno),
-                "group": group,
-                "tvgid": tvgid,
-                "logo": logo,
-                "streams": [{
-                    "url": url,
-                    "resolver": resolver if resolver else "auto",
-                    "ua": ua,
-                    "fs_regex": fs_regex,
-                    "disable": False
-                }],
-                "active_stream_index": 0,
-                "comment": ""
-            })
-    return channels
 
 
 def load_channels():
@@ -448,6 +388,16 @@ def save_cache():
     update_stream_settings (channels → cache) могли бы встать насмерть.
     """
     # Фаза 1: снимок config-стримов, без cache_lock.
+    #
+    # TOCTOU (допустим): между фазой 1 и фазой 2 UI может переставить
+    # стримы в config.json. Тогда cfg_ids не совпадут с реальным порядком,
+    # и в файл уедут неверные stream_id. При следующем load_cache _realign
+    # выровняет слоты по этим (ошибочным) id, что приведёт к съезду.
+    #
+    # Риск принят: UI-правки структуры стримов (перестановка, добавление,
+    # удаление) редки, а защита через channels_lock на всё время save_cache
+    # заблокирует UI-операции на время дискового I/O (50-200 мс). При
+    # следующем открытии модалки _realign всё равно всё выровняет.
     try:
         cfg_map = {}
         for ch in load_channels():
@@ -491,6 +441,33 @@ def save_cache():
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"channels": data_to_save}, f, ensure_ascii=False, indent=2)
         os.replace(tmp, IPTV_CACHE_FILE)
+
+
+def peek_channel_stream(name: str):
+    """Read-only peek at the active slot without triggering a resolve.
+
+    Возвращает (is_direct, payload, expire_time, is_stale) или None.
+    None — payload'а нет вообще (настоящий cache miss, нужен блокирующий
+    resolve). is_stale=True — payload есть, но cache_expire <= now.
+    """
+    active_idx = get_active_index(name)
+    with cache_lock:
+        entry = _epg_cache.get(name, {})
+        if not isinstance(entry, dict):
+            return None
+        streams = entry.get("streams_cache", [])
+        if not isinstance(streams, list):
+            return None
+        if not (isinstance(active_idx, int) and 0 <= active_idx < len(streams)):
+            return None
+        s = streams[active_idx]
+        if not isinstance(s, dict):
+            return None
+        payload = s.get("cached_stream")
+        if not payload:
+            return None
+        expire = s.get("cache_expire", 0)
+        return (s.get("cache_is_direct", True), payload, expire, expire <= time.time())
 
 
 def get_stream_cache(name: str, index: int):

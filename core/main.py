@@ -2,7 +2,6 @@ from routers import system, web, stream, channels, epg, jellyfin
 
 import os
 import asyncio
-import logging
 import threading
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles

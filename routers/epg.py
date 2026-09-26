@@ -27,7 +27,7 @@ async def save_all_changes(request: Request):
                 return JSONResponse({"success": False, "error": "Обнаружено пустое имя канала!"}, status_code=400)
 
         # Read-modify-write конфига держим в channels_lock через всю операцию,
-        # чтобы параллельный _fix_resolver из healthcheck или другая UI-правка
+        # чтобы параллельный healthcheck или другая UI-правка
         # не перетёрли наши изменения (и наоборот — чтобы мы не потеряли их).
         # state.channels_lock — RLock, поэтому load_channels() и
         # save_channels_to_file() внутри критической секции срабатывают
