@@ -660,28 +660,50 @@ async def mux_stream(name: str, request: Request):
         logger.info(f"[MUX] '{name}': video={video_url[:80]}, audio={audio_url[:80]}")
         mux_proc = get_or_create_mux(name, video_url, audio_url, user_agent, referer_str, cookie_str)
 
+    # q инициализируем None: если subscribe() упадёт, finally не сломается
+    # на NameError, а корректно пропустит unsubscribe.
+    q = None
     q = mux_proc.subscribe()
 
     async def stream_generator():
+        # MUX-BATCH-READ: q — asyncio.Queue, читаем напрямую через await q.get(),
+        # без thread-hop. После первого чанка забираем всё, что уже накопилось
+        # (get_nowait), чтобы уменьшить число yield-переключений event loop.
         empty_count = 0
         try:
             while True:
+                batch = []
                 try:
-                    chunk = await asyncio.to_thread(q.get, timeout=1.0)
+                    chunk = await asyncio.wait_for(q.get(), timeout=1.0)
+                    batch.append(chunk)
+                    # Добираем всё, что уже в очереди, без блокировки
+                    while True:
+                        try:
+                            nxt = q.get_nowait()
+                            batch.append(nxt)
+                        except asyncio.QueueEmpty:
+                            break
                     empty_count = 0
-                except queue.Empty:
+                except asyncio.TimeoutError:
                     empty_count += 1
                     if empty_count >= 30:
                         logger.warning(f"[MUX] '{name}': no data for 30s, closing stream")
                         break
                     continue
-                if chunk is None:
+
+                stop = False
+                for chunk in batch:
+                    if chunk is None:
+                        stop = True
+                        break
+                    yield chunk
+                if stop:
                     break
-                yield chunk
         except asyncio.CancelledError:
             pass
         finally:
-            mux_proc.unsubscribe(q)
+            if q is not None:
+                mux_proc.unsubscribe(q)
 
     return StreamingResponse(
         stream_generator(),

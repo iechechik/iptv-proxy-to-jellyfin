@@ -376,6 +376,35 @@ def _process_channel_check(name: str, ch: dict, task_id: str = None,
                 detail = (active_r or {}).get("detail") or "Active stream failed"
                 _set_slot_failure(name, active_index, detail)
 
+        # --- Pin resolvers (только fallback-каналы) ---
+        # Собираем все успешно резолвнутые стримы с method != auto/cache,
+        # у которых в конфиге стоит resolver=auto. Один вызов _fix_resolvers
+        # на канал: одна загрузка config.json, одна запись.
+        #
+        # Работает и для playing=True (кандидаты), и для playing=False
+        # (все стримы, включая активный).
+        if fallback_on:
+            streams_ch = ch.get("streams", [])
+            pins = []
+            for i, r in results_by_index.items():
+                if not r.get("success"):
+                    continue
+                m = r.get("method")
+                if not m or m in ("auto", "cache"):
+                    continue
+                if i >= len(streams_ch):
+                    continue
+                if not isinstance(streams_ch[i], dict):
+                    continue
+                if streams_ch[i].get("resolver", "auto") != "auto":
+                    continue
+                pins.append((i, m))
+            if pins:
+                try:
+                    _fix_resolvers(name, pins)
+                except Exception as e:
+                    logger.warning(f"[HEALTHCHECK] '{name}': _fix_resolvers failed: {e}")
+
         # --- Прогресс UI ---
         streams_results = []
         for i, r in results_by_index.items():
@@ -436,7 +465,14 @@ def _check_stream_with_cache(name: str, stream: dict, index: int, use_probe: boo
         is_direct, payload, expire_time = cached
         method = stream.get("resolver", "auto")
         if method == "auto":
-            method = "cache"
+            # Метод теряется при чтении из кэша (get_stream_cache возвращает
+            # только payload+expire). Читаем last_checked_resolver из слота —
+            # если он там есть, используем как method. Иначе "cache".
+            with state.cache_lock:
+                _entry = state._epg_cache.get(name, {})
+                _streams = _entry.get("streams_cache", []) if isinstance(_entry, dict) else []
+                _slot = _streams[s_idx] if 0 <= s_idx < len(_streams) else {}
+                method = (_slot.get("last_checked_resolver") if isinstance(_slot, dict) else None) or "cache"
     else:
         temp_ch = {
             "name": name,
@@ -500,6 +536,46 @@ def _check_stream_with_cache(name: str, stream: dict, index: int, use_probe: boo
         "is_direct": is_direct,
         "expire_time": expire_time,
     }
+
+
+def _fix_resolvers(name: str, pins: list):
+    """Пинит резолверы сразу для нескольких стримов канала.
+
+    pins — список [(stream_index, method), ...]. Внутри отбрасываются
+    method="auto"/"cache" и стримы, у которых resolver уже не auto.
+
+    Одна загрузка config.json, одна запись. Для канала с 3 auto-стримами
+    это 1 save вместо 3.
+
+    Вызывается из _process_channel_check для fallback-каналов после
+    проверки: пиним все успешно резолвнутые auto-стримы (и активный,
+    и кандидатов при playing).
+    """
+    cleaned = [(i, m) for i, m in pins if m not in ("auto", "cache")]
+    if not cleaned:
+        return
+    with state.channels_lock:
+        channels = state.load_channels()
+        for ch in channels:
+            if ch["name"] != name:
+                continue
+            streams = ch.get("streams", [])
+            changed = []
+            for idx, method in cleaned:
+                if idx >= len(streams):
+                    continue
+                if not isinstance(streams[idx], dict):
+                    continue
+                if streams[idx].get("resolver", "auto") != "auto":
+                    continue
+                streams[idx]["resolver"] = method
+                if ch.get("active_stream_index") == idx:
+                    ch["resolver"] = method
+                changed.append((idx, method))
+            if changed:
+                state.save_channels_to_file(channels)
+                logger.info(f"[HEALTHCHECK] '{name}': pinned {changed}")
+            break
 
 
 def _select_best_stream(candidates: list, active_index: int):
@@ -681,11 +757,68 @@ def stop_healthcheck_scheduler():
 # Совместимость со старым API
 # ---------------------------------------------------------------------------
 
+def _cleanup_tmp_artifacts():
+    """Чистка /tmp от артефактов Chromium/Playwright/Pulse.
+
+    Chromium и Playwright оставляют временные каталоги в /tmp при каждом
+    запуске sniffer. Они не удаляются сами и копятся сотнями за день
+    (каждый — несколько МБ).
+
+    Пороги:
+      - org.chromium.*, playwright_*, playwright-* — старше 1 часа;
+      - pulse-* — старше 24 часов (PulseAudio может держать его открытым
+        длительное время, пока жив процесс).
+
+    Логируем только если что-то реально удалено.
+    """
+    import os as _os
+    import time as _time
+    import glob as _glob
+    import shutil as _shutil
+
+    now = _time.time()
+    # (паттерн, порог в секундах)
+    rules = [
+        ("/tmp/org.chromium.*",  3600),   # 1 час
+        ("/tmp/playwright_*",    3600),   # 1 час
+        ("/tmp/playwright-*",    3600),   # 1 час (артефакты)
+        ("/tmp/pulse-*",        86400),   # 24 часа
+    ]
+    removed = 0
+    for pattern, max_age in rules:
+        for path in _glob.glob(pattern):
+            try:
+                if now - _os.path.getmtime(path) < max_age:
+                    continue
+                if _os.path.isdir(path):
+                    _shutil.rmtree(path, ignore_errors=True)
+                else:
+                    _os.remove(path)
+                removed += 1
+            except Exception:
+                pass
+    if removed:
+        logger.info(f"[CLEANUP] /tmp: removed {removed} stale artifacts")
+
+
+_TMP_CLEANUP_INTERVAL_SEC = 600  # 10 минут
+_last_tmp_cleanup = 0.0
+
+
 def background_cleanup():
+    global _last_tmp_cleanup
     while True:
         time.sleep(60)
         state.cleanup_expired_caches()
         cleanup_expired_segments()
+        # Чистка /tmp — реже, чем раз в 60 сек. glob по сотням файлов
+        # на каждой итерации даёт лишний CPU. 10 минут более чем
+        # достаточно: артефакты sniffer и так удаляются с порогом 1 час,
+        # актуальны только отложенные удаления.
+        now = time.time()
+        if now - _last_tmp_cleanup >= _TMP_CLEANUP_INTERVAL_SEC:
+            _cleanup_tmp_artifacts()
+            _last_tmp_cleanup = now
 
         # Чистим _last_active от давно неактивных имён.
         with state.cache_lock:

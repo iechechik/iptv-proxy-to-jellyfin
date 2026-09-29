@@ -612,7 +612,27 @@ def get_channel_stream(name: str):
 
 
 def set_active_stream_index(name: str, new_index: int):
-    # Read-modify-write конфига держим в channels_lock через всю операцию.
+    # Смена активного стрима = старый мукс читает мёртвый источник.
+    # Убиваем мукс ПЕРВЫМ, до обновления active_index и до снятия
+    # channels_lock.
+    #
+    # Почему такой порядок:
+    # 1. invalidate_mux() убивает ffmpeg-процесс (proc.kill + wait до 5 сек).
+    #    Это не мгновенно. Если сделать это ПОСЛЕ снятия channels_lock,
+    #    окно гонки: active_index уже новый, а старый мукс ещё жив и
+    #    читает мёртвый источник. Следующий GET /mux/{name}.ts может
+    #    подключиться к нему и получить мусор.
+    # 2. Если сделать это ПОД channels_lock — блокируем все правки конфига
+    #    на время kill. 5 сек — терпимо, и происходит это только при
+    #    смене стрима (редко). Лучше подержать лок, чем ловить гонку.
+    #
+    # Порядок: kill mux -> обновить config под channels_lock ->
+    # обновить cache_lock карту -> save_cache.
+    try:
+        invalidate_mux(name)
+    except Exception as e:
+        logger.warning(f"[MUX] '{name}': mux invalidation failed: {e}")
+
     with channels_lock:
         channels = load_channels()
         for ch in channels:
@@ -632,15 +652,6 @@ def set_active_stream_index(name: str, new_index: int):
     with cache_lock:
         pop_failed_resolve_for_channel(name)
         _active_index_map[name] = new_index
-
-    # Смена стрима = старый мукс-процесс читает мёртвый источник.
-    # invalidate_mux убивает ffmpeg (proc.kill + wait до 5 сек) — держать
-    # channels_lock на это время нельзя, заблокирует все правки конфига.
-    # Вызываем вне критической секции.
-    try:
-        invalidate_mux(name)
-    except Exception as e:
-        logger.warning(f"[MUX] '{name}': mux invalidation failed: {e}")
 
     save_cache()
 

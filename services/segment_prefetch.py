@@ -51,6 +51,14 @@ _prefetch_pool = ThreadPoolExecutor(
 _in_progress = set()
 _in_progress_lock = threading.Lock()
 
+# Потолок одновременных задач prefetch. ThreadPoolExecutor(max_workers=2)
+# берёт из своей очереди по 2 задачи, но сама очередь не ограничена:
+# если Jellyfin перезапросит манифест 10 раз подряд, туда уедет 30 задач.
+# Каждая — fetch того же сегмента, если предыдущий не докачался.
+# Ограничиваем по _in_progress: при достижении потолка новые задачи
+# в пул не ставим. 30 = 10 циклов манифеста при PREFETCH_MAX_SEGMENTS=3.
+MAX_IN_PROGRESS = 30
+
 # Ограничитель одновременных fetch к источникам (prefetch + Jellyfin).
 _fetch_semaphore = threading.Semaphore(IPTV_PREFETCH_FETCH_SEMAPHORE)
 
@@ -126,18 +134,29 @@ def schedule_prefetch(urls: list, headers: dict, channel: str = None) -> None:
     channel — только для читаемости логов.
     """
     scheduled = 0
+    skipped_by_limit = 0
     for url in urls:
         if get_cached_segment(url) is not None:
             continue
         with _in_progress_lock:
             if url in _in_progress:
                 continue
+            # Потолок одновременных задач. При достижении — все
+            # оставшиеся URL откладываем (break, не continue: лимит
+            # общий для всего списка, дальше проверять смысла нет).
+            if len(_in_progress) >= MAX_IN_PROGRESS:
+                skipped_by_limit = len(urls) - scheduled
+                break
             _in_progress.add(url)
         _prefetch_pool.submit(_do_prefetch, url, headers, channel)
         scheduled += 1
     if scheduled:
         tag = channel or '?'
         logger.debug(f"[PREFETCH] [{tag}] scheduled {scheduled} segments")
+    if skipped_by_limit:
+        tag = channel or '?'
+        logger.debug(f"[PREFETCH] [{tag}] {skipped_by_limit} segments skipped, "
+                     f"already {MAX_IN_PROGRESS} in progress")
 
 
 def cleanup_expired_segments() -> None:

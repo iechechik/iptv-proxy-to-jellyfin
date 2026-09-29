@@ -1,5 +1,6 @@
 import subprocess
 import threading
+import asyncio
 import time
 import queue
 
@@ -54,7 +55,7 @@ class MuxProcess:
         # соединение не считается оборванным вообще — reconnect выше
         # просто не наступает, ffmpeg ждёт бесконечно.
         reconnect_opts = [
-            "-thread_queue_size", "1024",
+            "-thread_queue_size", "4096",
             "-reconnect", "1",
             "-reconnect_streamed", "1",
             "-reconnect_delay_max", "5",
@@ -63,6 +64,9 @@ class MuxProcess:
 
         if headers_str:
             cmd += ["-headers", headers_str]
+        # -copyts + -start_at_zero: сохранить исходные PTS и сдвинуть
+        # первый в ноль. Без них -isync не работает.
+        cmd += ["-copyts", "-start_at_zero"]
         cmd += reconnect_opts + ["-user_agent", ua, "-i", video_url]
 
         if headers_str:
@@ -71,12 +75,11 @@ class MuxProcess:
         # аудио относительно первого входа (video) по разнице стартовых PTS.
         # Требует -copyts, чтобы PTS не перенормировались в ноль.
      ###cmd += ["-isync", "0"]
-        cmd += reconnect_opts + ["-user_agent", ua, "-i", audio_url,
-                # -copyts + -start_at_zero: сохранить исходные PTS
-                # (не пересчитывать от нуля) и одновременно сдвинуть вывод
-                # так, чтобы поток начинался с нуля. Без пары друг без
-                # друга не работают; нужны для -isync.
-            ####"-copyts", "-start_at_zero",
+        cmd += reconnect_opts + [
+                # -isync 0: выровнять timestamps второго входа (audio)
+                # по первому (video). Требует -copyts -start_at_zero выше.
+                "-isync", "0",
+                "-user_agent", ua, "-i", audio_url,
                 "-muxdelay", "0",
                 "-map", "0:v:0", "-map", "1:a:0",
                 "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
@@ -97,6 +100,9 @@ class MuxProcess:
         self.last_data_time = time.time()
         self._stopped = False
         self._stop_lock = threading.Lock()
+        # Event loop, в котором создаются asyncio.Queue подписчиков.
+        # Нужен для call_soon_threadsafe из _read_loop.
+        self._loop = None
         self._last_stderr_line = None
         self._last_stderr_repeat_log = 0.0
         # Рейтлимит queue-FULL warning.
@@ -111,16 +117,31 @@ class MuxProcess:
         # Диагностика: раз в 10 секунд показывает глубину очереди каждого
         # подписчика и давность последнего чанка от ffmpeg. Логируем
         # только когда есть активные подписчики, чтобы не шуметь.
+        #
+        # asyncio.Queue не имеет qsize() (в отличие от queue.Queue).
+        # Берём длину через приватный _queue (collections.deque) —
+        # в CPython 3.11 структура стабильна, len() к deque атомарен.
+        # Всё завёрнуто в try/except: диагностический поток НЕ должен
+        # падать ни от чего — иначе пропадает весь смысл диагностики.
         while not self._stopped:
             time.sleep(10)
-            with self.subscribers_lock:
-                if not self.subscribers:
-                    continue
-                sizes = [q.qsize() for q in self.subscribers]
-            age = time.time() - self.last_data_time
-            logger.info(
-                f"[MUX] '{self.name}': subs={len(sizes)} queues={sizes} last_data_age={age:.2f}s"
-            )
+            try:
+                with self.subscribers_lock:
+                    if not self.subscribers:
+                        continue
+                    subs_snapshot = list(self.subscribers)
+                sizes = []
+                for q in subs_snapshot:
+                    try:
+                        sizes.append(len(q._queue))
+                    except Exception:
+                        sizes.append(-1)
+                age = time.time() - self.last_data_time
+                logger.info(
+                    f"[MUX] '{self.name}': subs={len(sizes)} queues={sizes} last_data_age={age:.2f}s"
+                )
+            except Exception as e:
+                logger.warning(f"[MUX] '{self.name}': _stats_loop error: {e}")
 
     def _read_stderr(self):
         # Уровень вывода ffmpeg задаётся флагом -loglevel IPTV_FFMPEG_LOG_LEVEL.
@@ -163,6 +184,37 @@ class MuxProcess:
         logger.error(f"[MUX] '{self.name}': ffmpeg exited with code {return_code}")
 
     def _read_loop(self):
+        # Читаем stdout ffmpeg в отдельном потоке. Очереди подписчиков —
+        # asyncio.Queue, созданы в event loop, поэтому писать в них
+        # из этого потока можно только через loop.call_soon_threadsafe.
+        # Прямой put_nowait небезопасен: внутренний deque и wakeup
+        # waiter'ов не защищены от гонки.
+        def _enqueue_chunk(q, chunk):
+            """Вызывается в event loop через call_soon_threadsafe."""
+            try:
+                q.put_nowait(chunk)
+            except asyncio.QueueFull:
+                # Медленный клиент. Дропаем чанк для него,
+                # но НЕ отключаем: stream_generator в routers/stream.py
+                # вечно ждал бы данные из очереди, в которую больше
+                # никто не пишет.
+                self._queue_full_dropped += 1
+                now = time.time()
+                if (now - self._queue_full_last_log) >= _QUEUE_FULL_LOG_INTERVAL:
+                    logger.warning(
+                        f"[MUX] '{self.name}': subscriber queue FULL, "
+                        f"dropped {self._queue_full_dropped} chunks "
+                        f"({self._queue_full_dropped * 64 // 1024} MiB)"
+                    )
+                    self._queue_full_last_log = now
+                    self._queue_full_dropped = 0
+
+        def _enqueue_stop(q):
+            try:
+                q.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+
         try:
             while True:
                 chunk = self.proc.stdout.read1(65536)
@@ -170,37 +222,54 @@ class MuxProcess:
                     break
                 self.last_data_time = time.time()
                 with self.subscribers_lock:
-                    for q in self.subscribers:
+                    subs_snapshot = list(self.subscribers)
+                loop = self._loop
+                for q in subs_snapshot:
+                    if loop is not None and loop.is_running():
                         try:
-                            q.put_nowait(chunk)
-                        except queue.Full:
-                            # Медленный клиент. Дропаем чанк для него,
-                            # но НЕ отключаем: stream_generator в
-                            # routers/stream.py вечно ждал бы данные из
-                            # очереди, в которую больше никто не пишет.
-                            self._queue_full_dropped += 1
-                            now = time.time()
-                            if (now - self._queue_full_last_log) >= _QUEUE_FULL_LOG_INTERVAL:
-                                logger.warning(
-                                    f"[MUX] '{self.name}': subscriber queue FULL, "
-                                    f"dropped {self._queue_full_dropped} chunks "
-                                    f"({self._queue_full_dropped * 64 // 1024} MiB)"
-                                )
-                                self._queue_full_last_log = now
-                                self._queue_full_dropped = 0
+                            loop.call_soon_threadsafe(_enqueue_chunk, q, chunk)
+                        except RuntimeError:
+                            # loop уже закрыт — процесс останавливается.
+                            # Молча пропускаем, finally всё уберёт.
+                            pass
+                    else:
+                        # Fallback: loop не сохранён (subscribe вызван
+                        # вне async) — прямой put_nowait. CPython GIL
+                        # защищает от порчи памяти, но могут быть гонки
+                        # с waiter'ами. Ожидаемо не срабатывает.
+                        _enqueue_chunk(q, chunk)
         finally:
             with self.subscribers_lock:
-                for q in self.subscribers:
-                    try:
-                        q.put_nowait(None)
-                    except queue.Full:
-                        pass
+                subs_snapshot = list(self.subscribers)
                 self.subscribers.clear()
+            loop = self._loop
+            for q in subs_snapshot:
+                if loop is not None and loop.is_running():
+                    try:
+                        loop.call_soon_threadsafe(_enqueue_stop, q)
+                    except RuntimeError:
+                        pass
+                else:
+                    _enqueue_stop(q)
             self.stop()
 
     def subscribe(self):
-        # 200 чанков × 64 КБ ≈ 12.8 МБ ≈ 12 сек буфера при 8 Mbps.
-        q = queue.Queue(maxsize=500)
+        # asyncio.Queue вместо queue.Queue: потребитель в event loop
+        # читает напрямую через await q.get(), без thread-hop.
+        # Это устраняет bottleneck в routers/stream.py:mux_stream.
+        #
+        # Запоминаем loop, в котором создали очередь. _read_loop крутится
+        # в отдельном потоке, и кладёт в очередь через
+        # loop.call_soon_threadsafe — это единственный корректный способ
+        # писать в asyncio.Queue из чужого потока.
+        q = asyncio.Queue(maxsize=2000)
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # subscribe вызван из sync-контекста — крайне маловероятно
+            # (mux_stream в routers/stream.py — async def). Оставляем
+            # self._loop как None, put будет через прямой put_nowait.
+            self._loop = None
         with self.subscribers_lock:
             self.subscribers.append(q)
         self.last_activity = time.time()

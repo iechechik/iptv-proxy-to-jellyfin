@@ -184,6 +184,11 @@ def fix_hls_manifest(manifest_text: str, base_url: str, referer: str = None, coo
                 continue
             if line_str.startswith("#EXT-X-ENDLIST"):
                 continue
+            # NO-DISCONTINUITY: Jellyfin ffmpeg -f hls ломается на этом теге,
+            # уходит в цикл reconnect (error=End of file). Chrome/VLC тег
+            # игнорируют. Убираем — Jellyfin просто читает сегменты подряд.
+            if line_str.startswith("#EXT-X-DISCONTINUITY"):
+                continue
 
             if 'URI="' in line_str:
                 kind = None
