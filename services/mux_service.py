@@ -2,7 +2,6 @@ import subprocess
 import threading
 import asyncio
 import time
-import queue
 
 from core.config import logger, IPTV_MUX_MAX_PROCESSES, IPTV_MUX_IDLE_TIMEOUT, IPTV_FFMPEG_LOG_LEVEL
 

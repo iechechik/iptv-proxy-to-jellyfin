@@ -70,15 +70,12 @@ from core.config import (
 )
 import core.state as state
 from services.resolver import (
-    resolve_channel_payload, probe_stream, verify_stream_alive, parse_url_headers,
+    probe_stream, verify_stream_alive, parse_url_headers,
 )
-from services.events import send_broadcast_async, save_cache_and_broadcast
+from services.events import send_broadcast_async
 from services.segment_prefetch import cleanup_expired_segments
 from services.mux_service import is_mux_alive_and_fresh
-from services.limits import (
-    resolver_sem, sniffer_sem, flaresolverr_sem, probe_sem,
-    resolve_with_semaphores,
-)
+from services.limits import probe_sem, resolve_with_semaphores
 
 # ---------------------------------------------------------------------------
 # Глобальные структуры
@@ -821,7 +818,6 @@ def _kill_stale_chromium(max_age_sec: int = 90):
     уже закрывающиеся процессы.
     """
     import subprocess as _sp
-    import time as _t
     killed = 0
     patterns = ("headless_shell", "chrome", "chromium")
     try:

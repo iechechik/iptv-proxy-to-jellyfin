@@ -9,14 +9,12 @@
 """
 
 import asyncio
-import re
 import threading
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 import core.config as cfg
-import core.state as state
 from core.config import logger
 from services.playlist_service import (
     playlist_manager,

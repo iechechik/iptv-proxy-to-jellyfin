@@ -6,7 +6,6 @@ import os
 import re
 import time
 import asyncio
-import queue
 import threading
 from urllib.parse import quote, unquote, urljoin
 
@@ -15,14 +14,13 @@ from core.config import IPTV_DEFAULT_UA, IPTV_FETCH_TIMEOUT, IPTV_FAILED_RESOLVE
 from services.resolver import parse_url_headers
 from services.proxy_service import (
     _proxy_googlevideo_manifest, _build_redirect_response, fix_hls_manifest,
-    needs_mux, fetch_via_flaresolverr, read_response_text, sanitize_channel,
+    needs_mux, read_response_text, sanitize_channel,
 )
 from services.mux_service import get_or_create_mux
 from services.fallback import try_switch_to_healthy_stream
 from services.healthcheck import revalidate_channel_in_background
 from services.events import save_cache_and_broadcast
 from services.segment_prefetch import schedule_prefetch, get_cached_segment
-from services.limits import flaresolverr_sem
 
 router = APIRouter()
 
