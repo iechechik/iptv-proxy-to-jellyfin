@@ -22,6 +22,7 @@ _QUEUE_FULL_LOG_INTERVAL = 1.0
 
 
 class MuxProcess:
+    # single-input-mux-v1
     def __init__(self, name, video_url, audio_url, ua, referer=None, cookie=None):
         self.name = name
         # Параметры запуска. Нужны, чтобы get_or_create_mux мог сравнить
@@ -54,37 +55,54 @@ class MuxProcess:
         # чтение (микросекунды). Без него зависшее на рукопожатии
         # соединение не считается оборванным вообще — reconnect выше
         # просто не наступает, ffmpeg ждёт бесконечно.
+        # mux-timeouts-v1: -rw_timeout — если CDN молчит > 10 сек,
+        # ffmpeg переподключается. Иначе висит молча десятки секунд,
+        # /mux-стрим закрывается по empty_count, Jellyfin падает.
         reconnect_opts = [
             "-thread_queue_size", "4096",
             "-reconnect", "1",
             "-reconnect_streamed", "1",
             "-reconnect_delay_max", "5",
             "-timeout", "10000000",
+            "-rw_timeout", "10000000",
         ]
+
+        # single-input-mux-v1: если audio_url пусто — ffmpeg читает только
+        # video (в Pluto media уже есть A+V).
+        single_input = not audio_url
 
         if headers_str:
             cmd += ["-headers", headers_str]
+        # mux-timeouts-v1: -analyzeduration/-probesize — ffmpeg дольше
+        # анализирует входы до старта. Без этого первый запуск
+        # двухвходового мукса идёт без звука (audio-плейлист не прогрет).
+        cmd += ["-analyzeduration", "10000000", "-probesize", "10000000"]
         # -copyts + -start_at_zero: сохранить исходные PTS и сдвинуть
-        # первый в ноль. Без них -isync не работает.
+        # первый в ноль.
         cmd += ["-copyts", "-start_at_zero"]
         cmd += reconnect_opts + ["-user_agent", ua, "-i", video_url]
 
-        if headers_str:
-            cmd += ["-headers", headers_str]
-        # -isync 0: input-опция, применить ко второму входу. Синхронизирует
-        # аудио относительно первого входа (video) по разнице стартовых PTS.
-        # Требует -copyts, чтобы PTS не перенормировались в ноль.
-     ###cmd += ["-isync", "0"]
-        cmd += reconnect_opts + [
-                # -isync 0: выровнять timestamps второго входа (audio)
-                # по первому (video). Требует -copyts -start_at_zero выше.
-                "-isync", "0",
-                "-user_agent", ua, "-i", audio_url,
+        if single_input:
+            # Один вход: -map только video+audio из него.
+            cmd += [
                 "-muxdelay", "0",
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                "-map", "0:v:0", "-map", "0:a:0?",
+                "-c:v", "copy", "-c:a", "copy",
                 "-flush_packets", "1",
-                "-f", "mpegts", "pipe:1"]
+                "-f", "mpegts", "pipe:1",
+            ]
+        else:
+            if headers_str:
+                cmd += ["-headers", headers_str]
+            # Два входа: video отдельно, audio отдельно, синхронизация PTS.
+            cmd += reconnect_opts + [
+                    "-isync", "0",
+                    "-user_agent", ua, "-i", audio_url,
+                    "-muxdelay", "0",
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                    "-flush_packets", "1",
+                    "-f", "mpegts", "pipe:1"]
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,

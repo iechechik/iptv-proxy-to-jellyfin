@@ -109,7 +109,10 @@ def _build_redirect_response(payload: str, channel: str = None):
         return RedirectResponse(url=clean_url, status_code=302)
 
     logger.info(f"[PROXY] HLS proxy (resolver headers): {clean_url[:120]}")
-    proxy_url = f"/hls/manifest.m3u8?url={quote(clean_url, safe='')}"
+    # proxy-urls-v2: /hls/{channel}.m3u8?url=... — расширение в конце URL,
+    # иначе Jellyfin-ffmpeg 8.1 ругается "mismatches allowed extensions".
+    _ch_for_url = quote(channel or "stream", safe='')
+    proxy_url = f"/hls/{_ch_for_url}.m3u8?url={quote(clean_url, safe='')}"
     if referer:
         proxy_url += f"&referer={quote(referer, safe='')}"
     if cookie:
@@ -149,12 +152,28 @@ def fix_hls_manifest(manifest_text: str, base_url: str, referer: str = None, coo
                         "#EXT-X-PART:", "#EXT-X-PRELOAD-HINT:", "#EXT-X-RENDITION-REPORT:")
 
     def _proxy_uri(uri: str, kind: str) -> str:
+        # segment-ext-by-url-v1: расширение берём из ИСХОДНОГО URL.
+        # kind=segment раньше всегда давал .ts, но сегмент subtitle-манифеста
+        # может быть .vtt → .vtt в конце URL обязателен для ffmpeg 8.1.
         abs_uri = urljoin(base_url, uri)
         if "googlevideo.com" in abs_uri:
             return abs_uri
+        _ch = quote(channel or "stream", safe='')
+        low = abs_uri.lower().split("?")[0]
         if kind == "manifest":
-            return f"{proxy_host}/hls/manifest.m3u8?url={quote(abs_uri, safe='')}{params}"
-        return f"{proxy_host}/hls/segment.ts?url={quote(abs_uri, safe='')}{params}"
+            return f"{proxy_host}/hls/{_ch}.m3u8?url={quote(abs_uri, safe='')}{params}"
+        # Расширение по исходному URL — приоритет над kind для сегментов.
+        for ext, tag in ((".key", "key"), (".vtt", "vtt"), (".m4s", "m4s"),
+                         (".mp4", "mp4"), (".m4a", "m4a"), (".aac", "aac"),
+                         (".ac3", "ac3"), (".ts", "ts")):
+            if low.endswith(ext):
+                return f"{proxy_host}/hls/{_ch}.{tag}?url={quote(abs_uri, safe='')}{params}"
+        # Fallback по kind (если URL без явного расширения)
+        if kind == "key":
+            return f"{proxy_host}/hls/{_ch}.key?url={quote(abs_uri, safe='')}{params}"
+        if kind == "subtitle":
+            return f"{proxy_host}/hls/{_ch}.vtt?url={quote(abs_uri, safe='')}{params}"
+        return f"{proxy_host}/hls/{_ch}.ts?url={quote(abs_uri, safe='')}{params}"
 
     for line in lines:
         line_str = line.strip()
@@ -194,6 +213,10 @@ def fix_hls_manifest(manifest_text: str, base_url: str, referer: str = None, coo
                 kind = None
                 if any(line_str.startswith(t) for t in _MANIFEST_URI_TAGS):
                     kind = "manifest"
+                elif line_str.startswith("#EXT-X-KEY:") or line_str.startswith("#EXT-X-SESSION-KEY:"):
+                    kind = "key"
+                elif line_str.startswith("#EXT-X-MEDIA:") and 'TYPE=SUBTITLES' in line_str:
+                    kind = "subtitle"
                 elif any(line_str.startswith(t) for t in _BINARY_URI_TAGS):
                     kind = "segment"
                 if kind:
@@ -207,11 +230,21 @@ def fix_hls_manifest(manifest_text: str, base_url: str, referer: str = None, coo
         abs_url = urljoin(base_url, line_str)
         path_lower = abs_url.split("?")[0].lower()
 
+        _ch_url = quote(channel or "stream", safe='')
         if ".m3u8" in path_lower and "googlevideo.com" not in abs_url:
-            proxy_url = f"{proxy_host}/hls/manifest.m3u8?url={quote(abs_url, safe='')}{params}"
+            # proxy-urls-v2: /hls/{channel}.m3u8?url=...
+            proxy_url = f"{proxy_host}/hls/{_ch_url}.m3u8?url={quote(abs_url, safe='')}{params}"
             new_lines.append(proxy_url)
         elif (referer or cookie) and "googlevideo.com" not in abs_url:
-            proxy_ts_url = f"{proxy_host}/hls/segment.ts?url={quote(abs_url, safe='')}{params}"
+            # vtt-segment-ext-v1: расширение сегмента по его реальному пути.
+            # .vtt-сегменты subtitle-плейлиста обязаны идти на /hls/...vtt,
+            # иначе Jellyfin-ffmpeg 8.1 падает "mismatches allowed extensions".
+            _seg_ext = "ts"
+            for _e in ("vtt", "m4s", "mp4", "m4a", "aac", "ac3", "key"):
+                if path_lower.endswith("." + _e):
+                    _seg_ext = _e
+                    break
+            proxy_ts_url = f"{proxy_host}/hls/{_ch_url}.{_seg_ext}?url={quote(abs_url, safe='')}{params}"
             new_lines.append(proxy_ts_url)
         else:
             if "googlevideo.com" not in abs_url:

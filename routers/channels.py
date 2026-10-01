@@ -14,6 +14,73 @@ from services.epg_service import epg_manager
 
 router = APIRouter()
 
+
+def _apply_pre_resolved_cache(name: str, streams: list):
+    """Применяет cached_stream/cache_expire/probe_elapsed, пришедшие из UI.
+
+    UI мог проверить поток до сохранения канала (поток ещё не в config.json,
+    или это вообще новый канал). Результат лежит в streams[i].cached_stream.
+    Когда канал сохраняется — нужно записать этот payload в _epg_cache,
+    чтобы не терять результат «Проверить поток»/«Проверить ffprobe».
+
+    Вызывается ПОСЛЕ сохранения config.json и (для update-stream) после
+    _splice_streams_cache. Индексы в streams соответствуют слотам в _epg_cache.
+
+    Поля, которые могут прийти:
+      cached_stream  — payload (URL или URL|Referer=...|User-Agent=...)
+      cache_expire   — unixtime (не приходит от текущего UI, бэк пересчитает)
+      probe_elapsed  — секунды ffprobe
+
+    Если URL сменился относительно того, что лежит в слоте — не пишем.
+    Если cached_stream пустой — пропускаем.
+    """
+    if not isinstance(streams, list):
+        return
+    for i, s in enumerate(streams):
+        if not isinstance(s, dict):
+            continue
+        cached = s.get("cached_stream")
+        if not cached:
+            continue
+        # Проверяем, что слот ещё пуст или указывает на тот же URL.
+        with state.cache_lock:
+            entry = state._epg_cache.get(name, {})
+            if not isinstance(entry, dict):
+                entry = {"streams_cache": []}
+                state._epg_cache[name] = entry
+            slots = entry.setdefault("streams_cache", [])
+            while len(slots) <= i:
+                slots.append({})
+            if not isinstance(slots[i], dict):
+                slots[i] = {}
+            old_payload = slots[i].get("cached_stream")
+        # Если в слоте уже что-то есть — не перезаписываем (свежий резолв
+        # важнее, чем результат проверки, сделанный N минут назад в UI).
+        if old_payload:
+            continue
+
+        # Пересчитываем expire на бэке. cached_stream может быть с |Referer=,
+        # _compute_cache_expire это разбирает через parse_url_headers.
+        from services.resolver import _compute_cache_expire
+        # Метод для расчёта TTL не знаем точно — берём "auto", это даст
+        # дефолтный TTL по URL. Если в payload есть явный expire — он
+        # победит.
+        try:
+            expire_time = _compute_cache_expire(cached, "auto")
+        except Exception:
+            expire_time = time.time() + 600
+        is_direct = not cached.startswith("#EXTM3U")
+        probe_elapsed = s.get("probe_elapsed")
+        try:
+            state.set_stream_cache(
+                name, i, cached, is_direct, expire_time, "ui",
+                probe_elapsed=probe_elapsed,
+            )
+            logger.info(f"[CHANNELS] '{name}': applied pre-resolved cache for stream {i}")
+        except Exception as e:
+            logger.warning(f"[CHANNELS] '{name}': failed to apply cached_stream[{i}]: {e}")
+
+
 # Замечание по блокировкам:
 # Везде, где происходит «прочитать каналы → изменить в памяти → сохранить»,
 # мы держим state.channels_lock через всю операцию. Без этого параллельный
@@ -405,11 +472,29 @@ async def check_stream_mux(request: Request):
         if name:
             ch_found = state.get_channel(name)
             if ch_found:
+                # check-mux-slot-v1: ищем slot сначала по url из streams,
+                # потом по last_checked_url в кэше (на случай, если sniffer
+                # перерезолвил payload и cached_stream отличается от url,
+                # который прислал UI).
                 target_idx = None
                 for idx, s in enumerate(ch_found.get("streams", [])):
                     if s.get("url") == url:
                         target_idx = idx
                         break
+                if target_idx is None:
+                    with state.cache_lock:
+                        _entry = state._epg_cache.get(name, {})
+                        _slots = _entry.get("streams_cache", []) if isinstance(_entry, dict) else []
+                        for idx, slot in enumerate(_slots):
+                            if not isinstance(slot, dict):
+                                continue
+                            if slot.get("last_checked_url") == url:
+                                target_idx = idx
+                                break
+                # Если всё равно не нашли — пишем в активный (лучше, чем ничего).
+                if target_idx is None:
+                    target_idx = ch_found.get("active_stream_index", 0)
+                    logger.info(f"[CHECK-MUX] '{name}': URL не совпал ни с одним stream, пишу в активный slot {target_idx}")
                 if target_idx is not None:
                     state.set_stream_cache(name, target_idx, payload, is_direct,
                                            expire_time, method)
@@ -421,6 +506,7 @@ async def check_stream_mux(request: Request):
                         if not isinstance(streams[target_idx], dict):
                             streams[target_idx] = {}
                         streams[target_idx]["needs_mux"] = needs_mux_flag
+                        streams[target_idx]["last_checked_url"] = url
                     state.save_cache()
 
         return JSONResponse({"success": True, "needs_mux": needs_mux_flag, "method": method})
@@ -603,6 +689,12 @@ async def update_stream_settings(request: Request):
                 s["prefetch"] = True
             else:
                 s.pop("prefetch", None)
+            # mux-state-ui-v1: mux_state — только on/off, иначе убираем.
+            _ms = s.get("mux_state", "auto")
+            if _ms not in ("on", "off"):
+                s.pop("mux_state", None)
+            else:
+                s["mux_state"] = _ms
 
         # stream_id — identity стрима. Приходит из UI как скрытое поле.
         # Для существующих стримов сохраняем, для новых (созданных в UI) —
@@ -699,6 +791,11 @@ async def update_stream_settings(request: Request):
             sorted_channels = state.sort_channels_by_chno(channels)
             state.save_channels_to_file(sorted_channels)
 
+        # Применяем pre-resolved кэш из UI (см. _apply_pre_resolved_cache).
+        # Вызывается после _splice_streams_cache, чтобы индексы streams
+        # уже соответствовали слотам. Каналы с rename — берём new_name.
+        _apply_pre_resolved_cache(new_name, streams)
+
         state.save_cache()
         return JSONResponse({"success": True})
     except Exception as e:
@@ -777,6 +874,9 @@ async def add_new_channel(request: Request):
 
             sorted_channels = state.sort_channels_by_chno(channels)
             state.save_channels_to_file(sorted_channels)
+
+        # Применяем pre-resolved кэш из UI (см. _apply_pre_resolved_cache).
+        _apply_pre_resolved_cache(name, streams)
 
         logger.info(f"[CHANNELS] '{name}': added (chno={chno}, streams={len(streams)})")
         return JSONResponse({"success": True})

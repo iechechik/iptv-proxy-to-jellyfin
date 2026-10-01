@@ -1,4 +1,4 @@
-from routers import system, web, stream, channels, epg, jellyfin
+from routers import system, web, stream, channels, epg, jellyfin, playlists
 
 import os
 import asyncio
@@ -15,6 +15,7 @@ from services.healthcheck import (
 from services.mux_service import start_mux_watchdog
 from services.url_analytics import start_analytics
 from services.epg_service import epg_manager, build_filtered_epg, periodic_epg_update, update_all_sources
+from services.playlist_service import periodic_playlist_update
 from services.jellyfin_service import trigger_jellyfin_guide_refresh
 from core.logging_setup import setup_logging
 
@@ -25,6 +26,7 @@ app.include_router(stream.router)
 app.include_router(channels.router)
 app.include_router(epg.router)
 app.include_router(jellyfin.router)
+app.include_router(playlists.router)
 
 
 class NoCacheStaticFiles(StaticFiles):
@@ -117,6 +119,11 @@ def startup():
 
     threading.Thread(target=periodic_epg_update, daemon=True).start()
     logger.info("[EPG] background updater started (interval 1h)")
+
+    # Фоновое обновление внешних M3U-плейлистов.
+    # Раз в минуту проверяет interval каждого источника из playlist_sources.
+    threading.Thread(target=periodic_playlist_update, daemon=True, name="playlist-updater").start()
+    logger.info("[PLAYLIST] background updater started")
 
     logs_dir = "/app/logs"
     if not os.path.exists(logs_dir):

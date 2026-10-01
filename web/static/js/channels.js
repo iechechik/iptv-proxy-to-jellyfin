@@ -20,6 +20,14 @@ function getStreamsFromData() {
         // иначе слот в streams_cache потеряет привязку.
         if (s.stream_id) out.stream_id = s.stream_id;
         if (s.prefetch) out.prefetch = true;
+        // mux-state-ui-v1: mux_state — только on/off, auto не шлём.
+        if (s.mux_state === 'on' || s.mux_state === 'off') out.mux_state = s.mux_state;
+        // cached_stream — результат «Проверить поток» / «Проверить ffprobe»,
+        // полученный в UI до сохранения канала/потока. Уходит на бэк вместе
+        // с URL, чтобы не терять результат, когда потока ещё нет в config.json.
+        // cache_expire пересчитывается на бэке, сюда не идёт.
+        if (s.cached_stream) out.cached_stream = s.cached_stream;
+        if (s.elapsed != null) out.probe_elapsed = s.elapsed;
         return out;
     });
     const activeIdx = streamsData.findIndex(s => s.active);
@@ -70,6 +78,7 @@ function openSettings(originalName) {
                         disable: !!s.disable,
                         stream_id: s.stream_id || null,
                         prefetch: !!s.prefetch,
+                        mux_state: s.mux_state || 'auto',
                         needs_mux: cache.needs_mux !== undefined ? cache.needs_mux : null,
                         active: i === (ch.data.active_stream_index || 0),
                         cached_stream: cache.cached_stream || '',
@@ -120,7 +129,7 @@ function openAddModal() {
     document.getElementById('editGroup').value = '';
     document.getElementById('editLogo').value = '';
     document.getElementById('editComment').value = '';
-    streamsData = [{ url: '', resolver: 'auto', ua: '', fs_regex: '', disable: false, stream_id: null, prefetch: false, needs_mux: null, active: true, cached_stream: '' }];
+    streamsData = [{ url: '', resolver: 'auto', ua: '', fs_regex: '', disable: false, stream_id: null, prefetch: false, mux_state: 'auto', needs_mux: null, active: true, cached_stream: '' }];
     currentSelectedEpgId = '';
     currentSelectedEpgName = '';
     currentSelectedSourceName = '';
@@ -226,14 +235,24 @@ function saveStreamsFromModal() {
         const sidRaw = item.querySelector('.stream-id')?.value || '';
         const sid = parseInt(sidRaw, 10);
         const disableCb = item.querySelector('input[onchange^="setStreamDisable"]');
+        const urlVal = item.querySelector('.stream-url').value;
+        // cached_stream и elapsed не перезаписываем, если URL изменился
+        // (payload от старого URL невалиден). Раньше эти поля терялись
+        // вообще — теперь сохраняем, если URL тот же.
+        const oldStream = streamsData[idx] || {};
+        const urlChanged = oldStream.url !== urlVal;
         newStreams.push({
-            url: item.querySelector('.stream-url').value,
+            url: urlVal,
             resolver: item.querySelector('.stream-resolver').value,
             ua: item.querySelector('.stream-ua').value,
             fs_regex: item.querySelector('.stream-fs-regex').value,
             disable: disableCb ? disableCb.checked : false,
             stream_id: Number.isFinite(sid) && sid > 0 ? sid : null,
             prefetch: item.querySelector('.stream-prefetch')?.checked || false,
+            mux_state: item.querySelector('.stream-mux-state')?.value || 'auto',
+            cached_stream: urlChanged ? '' : (oldStream.cached_stream || ''),
+            cache_expire: urlChanged ? 0 : (oldStream.cache_expire || 0),
+            elapsed: urlChanged ? null : (oldStream.elapsed || null),
             active: false
         });
     });
@@ -242,13 +261,24 @@ function saveStreamsFromModal() {
     newStreams.forEach((s, i) => s.active = (i === activeIdx));
     streamsData = newStreams;
 
-    // Обновляем активный URL и резолвер в модалке канала
+    // Обновляем активный URL, резолвер, кэш и пробу в модалке канала.
+    // Раньше editCachedStream/editProbeElapsed оставались от openSettings —
+    // старые значения до перезагрузки, что путает: пользователь только что
+    // проверил новый поток, а в модалке канала торчит payload старого.
     const activeStream = streamsData.find(s => s.active);
     if (activeStream) {
         const activeUrlInput = document.getElementById('editActiveUrl');
         if (activeUrlInput) activeUrlInput.value = activeStream.url;
         const resolverInput = document.getElementById('editActiveResolver');
         if (resolverInput) resolverInput.value = activeStream.resolver || 'auto';
+        const cachedInput = document.getElementById('editCachedStream');
+        if (cachedInput) cachedInput.value = activeStream.cached_stream || '';
+        const probeInput = document.getElementById('editProbeElapsed');
+        if (probeInput) {
+            probeInput.value = activeStream.elapsed != null
+                ? parseFloat(activeStream.elapsed).toFixed(1) + ' с'
+                : '—';
+        }
     }
 
     closeStreamsModal();
@@ -256,7 +286,7 @@ function saveStreamsFromModal() {
 }
 
 function addStreamField() {
-    const newStream = { url: '', resolver: 'auto', ua: '', fs_regex: '', disable: false, stream_id: null, prefetch: false, needs_mux: null, active: false, cached_stream: '' };
+    const newStream = { url: '', resolver: 'auto', ua: '', fs_regex: '', disable: false, stream_id: null, prefetch: false, mux_state: 'auto', needs_mux: null, active: false, cached_stream: '' };
     streamsData.push(newStream);
     const index = streamsData.length - 1;
     addStreamFieldToDOM(newStream, index);
@@ -293,8 +323,16 @@ function addStreamFieldToDOM(stream, index) {
                 <input type="checkbox" class="stream-prefetch" ${stream.prefetch ? 'checked' : ''}>
                 Prefetch
             </label>
+            <label style="display: flex; align-items: center; gap: 4px; font-size: 13px; color: var(--text-muted);" title="auto — по needs_mux; on — всегда мукс; off — никогда">
+                mux:
+                <select class="stream-mux-state" style="background: var(--bg-color); border: 1px solid var(--border-color); color: var(--text-main); padding: 4px 6px; border-radius: 6px; font-size: 12px;">
+                    <option value="auto" ${(stream.mux_state || 'auto') === 'auto' ? 'selected' : ''}>auto</option>
+                    <option value="on" ${stream.mux_state === 'on' ? 'selected' : ''}>on</option>
+                    <option value="off" ${stream.mux_state === 'off' ? 'selected' : ''}>off</option>
+                </select>
+            </label>
             <span class="stream-mux-status" style="display: flex; align-items: center;">
-                ${renderMuxBadge(stream.needs_mux, index)}
+                ${renderMuxBadge(stream.needs_mux, index, stream.mux_state)}
             </span>
             <button class="btn-sm btn-danger" style="margin-left: auto;" onclick="removeStreamField(${index})">Удалить</button>
         </div>
@@ -303,6 +341,7 @@ function addStreamFieldToDOM(stream, index) {
             <div style="display: flex; align-items: center;">
                 <label style="width: 120px; flex-shrink: 0; text-align: right; margin-right: 8px; font-size: 13px; color: var(--text-muted);">URL:</label>
                 <input type="text" class="stream-url" value="${stream.url || ''}" style="flex: 1; background: var(--bg-color); border: 1px solid var(--border-color); color: var(--text-main); padding: 6px 10px; border-radius: 6px;">
+                <button class="btn-sm" onclick="openPlaylistSearch(${index})" title="Найти URL в плейлистах" style="margin-left: 6px;">🔍</button>
             </div>
             <div style="display: flex; align-items: center;">
                 <label style="width: 120px; flex-shrink: 0; text-align: right; margin-right: 8px; font-size: 13px; color: var(--text-muted);">Резолвер:</label>
@@ -372,7 +411,14 @@ function setStreamDisable(index, checked) {
     if (streamsData[index]) streamsData[index].disable = checked;
 }
 
-function renderMuxBadge(needsMux, index) {
+function renderMuxBadge(needsMux, index, muxState) {
+    // ui-mux-state-badge-v1: mux_state из config > needs_mux.
+    if (muxState === 'on') {
+        return '<span class="mux-badge mux-on" title="mux_state=on (мукс принудительно)">MUX</span>';
+    }
+    if (muxState === 'off') {
+        return '<span class="mux-badge mux-off" title="mux_state=off (мукс отключён)">no-mux</span>';
+    }
     if (needsMux === true) {
         return '<span class="mux-badge mux-on" title="По master-плейлисту требуется мукс (раздельные A/V)">MUX</span>';
     } else if (needsMux === false) {
@@ -402,7 +448,7 @@ function checkStreamMux(index) {
     .then(res => {
         if (res.success) {
             streamsData[index].needs_mux = res.needs_mux;
-            if (statusEl) statusEl.innerHTML = renderMuxBadge(res.needs_mux, index);
+            if (statusEl) statusEl.innerHTML = renderMuxBadge(res.needs_mux, index, streamsData[index]?.mux_state);
         } else {
             if (statusEl) statusEl.innerHTML = '<span style="color:#ef4444;font-size:12px;">ошибка</span>';
             showToast('Ошибка: ' + (res.error || ''));
@@ -473,9 +519,15 @@ function probeChannelStream() {
     const newName = document.getElementById('editName').value.trim();
     const effectiveName = originalName || newName;
 
+    // URL шлём всегда. В add-режиме канала в config.json нет — бэк по name
+    // ничего не найдёт, но payload вернёт и применит через _apply_pre_resolved_cache
+    // при сохранении. В edit-режиме URL указывает на конкретный (возможно,
+    // ещё не сохранённый) поток: бэк запишет payload в его слот по url.
+    // Раньше для edit шло url: null, и probe шёл в активный слот _epg_cache,
+    // который мог быть старым — тогда probe бил по не тому URL.
     const requestBody = {
         name: effectiveName,
-        url: isAddMode ? activeStream.url : null,
+        url: activeStream.url,
         ua: activeStream.ua,
         fs_regex: activeStream.fs_regex,
         resolver: activeStream.resolver

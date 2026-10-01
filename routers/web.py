@@ -77,11 +77,27 @@ def manage_page(request: Request):
             )
         except Exception:
             pass
+        # mux-state-ui-v1: учитываем mux_state активного stream.
         mux_needed = bool(active_slot.get("needs_mux", False)) if isinstance(active_slot, dict) else False
-        if mux_alive:
-            mux_badge = ' <span class="mux-badge mux-on" title="Мукс работает сейчас">MUX</span>'
+        channel_mux_state = ch.get("mux_state", "auto")
+        _active_streams = ch.get("streams", [])
+        if 0 <= active_idx < len(_active_streams) and isinstance(_active_streams[active_idx], dict):
+            channel_mux_state = _active_streams[active_idx].get("mux_state", "auto")
+
+        # mux-off-kills-v1: mux_state=off приоритетнее mux_alive.
+        if channel_mux_state == "off":
+            mux_badge = ' <span class="mux-badge mux-off" title="mux_state=off (мукс отключён)">no-mux</span>'
+        elif mux_alive:
+            _title = "Мукс работает сейчас"
+            if channel_mux_state == "on":
+                _title = "Мукс работает сейчас (mux_state=on)"
+            mux_badge = f' <span class="mux-badge mux-on" title="{_title}">MUX</span>'
+        elif channel_mux_state == "on":
+            mux_badge = ' <span class="mux-badge mux-req" title="mux_state=on (мукс принудительно, ещё не запущен)">MUX</span>'
         elif mux_needed:
             mux_badge = ' <span class="mux-badge mux-req" title="Требуется мукс (по master-плейлисту)">MUX</span>'
+        elif channel_mux_state == "off":
+            mux_badge = ' <span class="mux-badge mux-off" title="mux_state=off (мукс отключён)">no-mux</span>'
         else:
             mux_badge = ''
 

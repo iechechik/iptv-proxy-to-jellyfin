@@ -2,6 +2,18 @@ document.addEventListener('DOMContentLoaded', () => {
     checkStatus();
     connectSSE();
 
+    // Восстанавливаем активную вкладку после F5.
+    // Сначала показываем body — оно было скрыто скриптом в index.html,
+    // чтобы не мигало первой вкладкой. Восстанавливаем вкладку и
+    // показываем всё в одном кадре — мерцания нет.
+    try {
+        const saved = sessionStorage.getItem('activeTab');
+        if (saved && document.getElementById('tab-' + saved)) {
+            switchTab(saved);
+        }
+    } catch (e) {}
+    document.body.style.visibility = 'visible';
+
     const logsContainer = document.getElementById('logsContainer') || document.getElementById('logs');
     if (logsContainer) {
         loadLogs();

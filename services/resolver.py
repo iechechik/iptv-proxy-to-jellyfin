@@ -33,8 +33,19 @@ def is_direct_stream(url: str) -> bool:
     return any(p in url.lower() for p in direct_patterns)
 
 def extract_m3u8_from_text(text: str) -> str | None:
-    match = re.search(r'https?://[^\s"\'<>]+?\.m3u8[^\s"\'<>]*', text)
-    return match.group(0) if match else None
+    """Первый не-рекламный m3u8-URL из текста.
+
+    Раньше возвращал первое совпадение — и если на странице висел
+    рекламный превью-плеер (VMAP, DoubleClick), flare-session отдавал
+    рекламный манифест вместо эфирного. Теперь идём по всем совпадениям
+    и возвращаем первый, у которого URL не содержит рекламных маркеров.
+    Если все рекламные — None.
+    """
+    matches = re.findall(r'https?://[^\s"\'<>]+?\.m3u8[^\s"\'<>]*', text)
+    for m in matches:
+        if not _is_ad_url(m):
+            return m
+    return None
 
 def parse_url_headers(raw_url: str):
     """
@@ -107,6 +118,38 @@ _URL_EXPIRY_PATTERNS = (
 
 # Запас: не отдаём клиенту URL, который вот-вот протухнет.
 _EXPIRY_SAFETY_MARGIN = 30
+
+# Маркеры рекламных манифестов/URL. Если URL содержит любой из них —
+# считаем его рекламным и не берём в результат резолва. Список пополняется
+# по мере появления новых рекламных паттернов в реальных источниках.
+# Первые три — самые частые (IAB VMAP/VAST, Google IMA/DoubleClick).
+_AD_URL_MARKERS = (
+    "vmap",                 # Video Multiple Ad Playlist (IAB)
+    "vast",                 # Video Ad Serving Template
+    "doubleclick",          # Google рекламный
+    "googlesyndication",    # Google рекламный
+    "imasdk",               # Google Interactive Media Ads SDK
+    "adservice",            # generic ad service
+    "adserver",             # generic ad server
+    "preroll",              # pre-roll
+    "midroll",              # mid-roll
+    "postroll",             # post-roll
+    "/ad/",                 # типичный путь на рекламных CDN
+    "/ads/",
+)
+
+
+def _is_ad_url(url: str) -> bool:
+    """True, если URL похож на рекламный манифест.
+
+    Используется:
+      - в sniffer — не считать рекламу результатом резолва;
+      - в extract_m3u8_from_text — выбрать первый НЕ-рекламный m3u8 из HTML.
+    """
+    if not url:
+        return False
+    low = url.lower()
+    return any(m in low for m in _AD_URL_MARKERS)
 
 
 def _is_session_url(url: str) -> bool:
@@ -530,8 +573,316 @@ def resolve_youtube_stream(url: str, ua: str, name: str):
             logger.warning(f"[RESOLVE] '{name}': yt-dlp (youtube) failed: {e2}")
             raise RuntimeError(f"All YouTube methods failed for {name}")
 
-def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int) -> Optional[Dict[str, str]]:
-    found_result: Optional[Dict[str, str]] = None
+# ---------------------------------------------------------------------------
+# VOD-фильтр для sniffer.
+#
+# Реклама и прероллы отдаются HLS-плеером как обычный m3u8, но это VOD:
+# в манифесте есть #EXT-X-ENDLIST или #EXT-X-PLAYLIST-TYPE:VOD.
+# Живой эфир этих тегов НИКОГДА не содержит (требование HLS-спеки).
+#
+# Функция идёт по цепочке master → media (берёт первый #EXT-X-STREAM-INF)
+# и проверяет итоговый media-манифест. Один HTTP-запрос, таймаут 5 сек.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Детект рекламы в HLS-манифесте.
+#
+# Слой 1 (теги, 100% надёжно): #EXT-X-CUE-OUT / CUE-IN /
+#   #EXT-X-DATERANGE с SCTE35-OUT / #EXT-X-SPLICEPOINT-SCTE35.
+#   Признак серверной вставки (SSAI).
+#
+# Слой 2 (длительности): рекламные креативы 15/30/45/60/90 сек,
+#   контент 6-10 сек. Если медиана <=12с, а есть >=15с — вставка.
+#
+# Если оба слоя дали False — решает video_id в _run_browser_sniffer_sync.
+# Dailymotion CSAI (IMA SDK) не оставляет тегов в манифесте, для него
+# работает только video_id.
+# ---------------------------------------------------------------------------
+
+# ad-check-master-skip-v1: убраны #EXT-X-CUE-OUT / #EXT-X-CUE-IN.
+# Это метки SSAI-вставок в ЖИВОМ эфире (Sky News, Pluto, AWS MediaTailor).
+# Они не означают, что поток — реклама. Jellyfin корректно проигрывает
+# live с CUE-тегами. Оставляем только жёсткие SCTE-35-маркеры, которые
+# в живых эфирах встречаются редко.
+_AD_TAG_MARKERS = (
+    "#EXT-X-SPLICEPOINT-SCTE35",
+    "SCTE35-OUT",
+    "SCTE35-IN",
+)
+
+
+# hls-classify-by-name-v1
+# Стандартные имена HLS-манифестов. Используется в handle_request,
+# чтобы не ждать handle_response (который может не прийти из-за 302,
+# Content-Type: text/html, пустого тела и т.п.).
+_HLS_MASTER_NAMES = ("master.m3u8",)
+_HLS_MEDIA_NAMES = ("playlist.m3u8", "chunklist", "index.m3u8", "media.m3u8", "prog_index.m3u8")
+
+
+def _classify_hls_by_url(url: str):
+    """Возвращает (is_master, is_media) по имени файла в URL.
+    Оба False, если имя нестандартное — тогда классифицирует handle_response.
+    """
+    if not url:
+        return (False, False)
+    low = url.lower().split("?", 1)[0]
+    # sub-manifest в query (URI=... в master) не считаем — там будет свой запрос
+    fname = low.rsplit("/", 1)[-1]
+    for n in _HLS_MASTER_NAMES:
+        if fname == n or fname.endswith("/" + n) or low.endswith(n):
+            return (True, False)
+    for n in _HLS_MEDIA_NAMES:
+        if fname == n or fname.endswith("/" + n):
+            return (False, True)
+        # chunklist_*.m3u8 (Pluto, некоторые CDN)
+        if n == "chunklist" and "chunklist" in fname:
+            return (False, True)
+    return (False, False)
+
+
+def _is_ad_manifest(payload: str, timeout: int = 5) -> bool:
+    if not payload:
+        return False
+    clean_url, headers_dict = parse_url_headers(payload)
+    if not clean_url.startswith(("http://", "https://")):
+        return False
+
+    req_headers = {"User-Agent": headers_dict.get("User-Agent", IPTV_DEFAULT_UA)}
+    if headers_dict.get("Referer"):
+        req_headers["Referer"] = headers_dict["Referer"]
+    if headers_dict.get("Cookie"):
+        req_headers["Cookie"] = headers_dict["Cookie"]
+
+    def _fetch(u):
+        req = urllib.request.Request(u, headers=req_headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="ignore")
+
+    try:
+        body = _fetch(clean_url)
+    except Exception as e:
+        logger.debug(f"[SNIFFER] ad-check fetch failed: {e}")
+        return False
+
+    if "#EXT-X-STREAM-INF" in body:
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip().startswith("#EXT-X-STREAM-INF"):
+                if i + 1 < len(lines):
+                    nxt = lines[i + 1].strip()
+                    if nxt and not nxt.startswith("#"):
+                        try:
+                            media_url = urljoin(clean_url, nxt)
+                            body = _fetch(media_url)
+                        except Exception as e:
+                            logger.debug(f"[SNIFFER] ad-check media fetch failed: {e}")
+                            return False
+                break
+
+    for marker in _AD_TAG_MARKERS:
+        if marker in body:
+            logger.info(f"[SNIFFER] ad tag found: {marker}")
+            return True
+
+    extinfs = re.findall(r"#EXTINF:([0-9.]+)", body)
+    if extinfs:
+        durs = []
+        for d in extinfs:
+            try:
+                durs.append(float(d))
+            except ValueError:
+                pass
+        if len(durs) >= 4:
+            srt = sorted(durs)
+            median = srt[len(srt) // 2]
+            if median <= 12.0:
+                outliers = [d for d in durs if d >= 15.0]
+                if outliers:
+                    logger.info(
+                        f"[SNIFFER] ad by durations: median={median:.1f}s, "
+                        f"outliers={outliers[:5]}"
+                    )
+                    return True
+
+    return False
+
+
+_VIDEO_ID_QUERY_KEYS = ("video_id", "vid", "stream_id", "videoid")
+
+
+def _extract_video_id(url: str) -> str:
+    if not url:
+        return ""
+    clean = url.split("|", 1)[0]
+    m = re.search(r"/video/([A-Za-z0-9_-]+)\.m3u8", clean)
+    if m:
+        return m.group(1)
+    m = re.search(r"/([A-Za-z0-9_-]{6,})\.m3u8", clean)
+    if m:
+        return m.group(1)
+    try:
+        from urllib.parse import urlparse, parse_qs
+        qs = parse_qs(urlparse(clean).query)
+        for k in _VIDEO_ID_QUERY_KEYS:
+            if k in qs and qs[k]:
+                return qs[k][0]
+    except Exception:
+        pass
+    return ""
+
+
+def _root_host(url: str) -> str:
+    """Корневой хост: последние два компонента hostname.
+    www.dailymotion.com -> dailymotion.com
+    live2.eu-north-1b.cf.dmcdn.net -> dmcdn.net
+    """
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url.split("|", 1)[0]).hostname or ""
+        parts = host.split(".")
+        return ".".join(parts[-2:]) if len(parts) >= 2 else host
+    except Exception:
+        return ""
+
+
+def resolve_via_browser_sniffer(target_url: str, ua: str = None, max_timeout: int = 15) -> Optional[Dict[str, str]]:
+    """2 попытки: 1-я -> ad-check; если реклама -> 2-я с skip_urls.
+
+    SNIFFER_WRAPPER_NO_TIMEOUT_V4:
+    future.result() без таймаута. _run_browser_sniffer_sync сам себя
+    ограничивает max_timeout'ом изнутри (wait-loop + navigation_timeout
+    Playwright). Внешний future.result(timeout=...) срабатывал РАНЬШЕ,
+    чем sniffer успевал закончить: обёртка возвращала None, теряя
+    уже найденный кандидат.
+    """
+    skip_urls = set()
+    ua_final = ua or IPTV_DEFAULT_UA
+
+    for attempt in range(2):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                _run_browser_sniffer_sync, target_url, ua_final, max_timeout, skip_urls
+            )
+            # Без timeout: ждём реального завершения. Внутри — свой max_timeout.
+            res = future.result()
+
+        if not res:
+            return None
+
+        if res.get("type") != "m3u8":
+            return res
+
+        # ad-check-master-skip-v1: master НЕ проверяем на рекламу.
+        # Master — входная точка в HLS. Реклама — это media (VOD с
+        # короткими сегментами). Мастер с CUE/SCTE — норма для live SSAI.
+        if res.get("is_master"):
+            return res
+
+        payload = res.get("url", "")
+        if _is_ad_manifest(payload):
+            clean = payload.split("|")[0]
+            logger.info(f"[SNIFFER] ad detected (attempt {attempt + 1}), retry: {clean[:120]}")
+            skip_urls.add(clean)
+            continue
+
+        return res
+
+    logger.warning(f"[SNIFFER] all attempts returned ad: {target_url}")
+    return None
+
+
+def _pick_best_candidate(candidates: list, channel_name: str = None):
+    """Выбор лучшего m3u8-кандидата.
+
+    1. embed — приоритет.
+    2. ad video_id -> set.
+    3. master'ы: те, чей video_id НЕ в ad-set. Если есть — берём последний.
+    4. medi'и: последняя (эфир на CDN).
+    5. (B) master-vs-media CDN: если master и media на разных
+       корневых доменах — предпочитаем media (эфир на отдельном CDN).
+    """
+    tag = f"[{channel_name}] " if channel_name else ""
+
+    # embed
+    for c in candidates:
+        if c.get("type") == "embed":
+            return c
+
+    # ad video_id set
+    ad_vids = set()
+    for c in candidates:
+        if c.get("is_ad"):
+            v = _extract_video_id(c.get("url", ""))
+            if v:
+                ad_vids.add(v)
+    if ad_vids:
+        logger.info(f"[SNIFFER] {tag}ad video_ids: {sorted(ad_vids)}")
+
+    masters = [c for c in candidates
+               if c.get("type") == "m3u8" and c.get("is_master")
+               and not c.get("is_ad")]
+    medias = [c for c in candidates
+              if c.get("type") == "m3u8" and c.get("is_media")
+              and not c.get("is_ad")]
+
+    # Отбрасываем master'ы с video_id из ad-set
+    filtered_masters = []
+    for c in masters:
+        vid = _extract_video_id(c.get("url", ""))
+        if vid and vid in ad_vids:
+            logger.info(f"[SNIFFER] {tag}master dropped (vid={vid!r} == ad): {c['url'][:120]}")
+            continue
+        filtered_masters.append(c)
+
+    # Правило (B): если media на другом корневом хосте, чем master — media вперёд
+    if filtered_masters and medias:
+        m_host = _root_host(filtered_masters[-1].get("url", ""))
+        d_host = _root_host(medias[-1].get("url", ""))
+        if m_host and d_host and m_host != d_host:
+            logger.info(
+                f"[SNIFFER] {tag}master/media different CDN "
+                f"({m_host} vs {d_host}) -> prefer media"
+            )
+            chosen = medias[-1]
+            logger.info(f"[SNIFFER] {tag}selected media (CDN mismatch): {chosen['url'][:120]}")
+            return chosen
+
+    if filtered_masters:
+        chosen = filtered_masters[-1]
+        logger.info(f"[SNIFFER] {tag}selected master: {chosen['url'][:120]}")
+        return chosen
+
+    if medias:
+        chosen = medias[-1]
+        logger.info(f"[SNIFFER] {tag}selected media (no live master): {chosen['url'][:120]}")
+        return chosen
+
+    # Прочие m3u8 (не классифицированные) — fallback
+    for c in candidates:
+        if c.get("type") == "m3u8" and not c.get("is_ad"):
+            logger.info(f"[SNIFFER] {tag}selected unclassified m3u8: {c['url'][:120]}")
+            return c
+
+    logger.warning(f"[SNIFFER] {tag}no usable m3u8/embed found")
+    return None
+
+
+def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int, skip_urls: set = None) -> Optional[Dict[str, str]]:
+    # Список кандидатов. Каждый — dict:
+    #   {"url": str, "type": "m3u8"|"embed", "cache_control": str,
+    #    "ct": str, "is_master": bool, "is_media": bool, "ts": float}
+    #
+    # Раньше был один found_result — первое попавшееся .m3u8. Это могло
+    # быть рекламное (VMAP, DoubleClick) или неверное качество. Теперь
+    # собираем все не-рекламные и выбираем лучший: master > media.
+    #
+    # master определяем по телу ответа: если в первых 500 байтах есть
+    # "#EXT-X-STREAM-INF" — это master (список битрейтов).
+    # media: есть "#EXTINF" и нет "#EXT-X-STREAM-INF".
+    candidates: list = []
+    master_seen_ts: float = 0.0  # когда нашли первый master (для раннего выхода)
+    _skip_urls = skip_urls or set()
+
     user_agent = ua or IPTV_DEFAULT_UA
     exec_path = IPTV_PLAYWRIGHT_CHROMIUM
 
@@ -581,23 +932,61 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int) -> Opt
 
 
             def handle_request(request):
-                nonlocal found_result
+                # Слушаем все запросы. Собираем .m3u8 (кроме рекламных)
+                # и embed-ссылки. Никакого "поймал один — вышел": плеер
+                # сначала может запросить рекламу (VMAP → XML), потом master,
+                # потом media. Нам нужны все, чтобы выбрать лучший.
                 req_url = request.url
                 low = req_url.lower()
-                if found_result:
-                    return
-                # DASH (.mpd) игнорируем: наш прокси умеет только HLS.
                 if ".mpd" in low and not any(ext in low for ext in [".ts", ".m4s", ".key", ".aac", ".mp4"]):
                     logger.info(f"[SNIFFER] DASH ignored: {req_url[:120]}")
                     return
-                if ".m3u8" in low and not any(ext in low for ext in [".ts", ".m4s", ".key", ".aac", ".mp4"]):
-                    found_result = {"type": "m3u8", "url": req_url}
+                if ".m3u8" in low and not any(ext in low for ext in [".ts", ".m4s", ".key", ".aac", ".mp4", ".m4a"]):
+                    if req_url in _skip_urls:
+                        logger.info(f"[SNIFFER] skip_url (previous ad): {req_url[:120]}")
+                        return
+                    is_ad_flag = _is_ad_url(req_url)
+                    if is_ad_flag:
+                        logger.info(f"[SNIFFER] ad manifest (kept for vid-compare): {req_url[:120]}")
+                    # hls-classify-by-name-v1: классифицируем сразу по имени файла.
+                    # handle_response может не прийти (302, HTML ct), тогда
+                    # кандидат остался бы без флагов и выпал из выбора.
+                    m, md = _classify_hls_by_url(req_url)
+                    # Уже в списке?
+                    for c in candidates:
+                        if c.get("url") == req_url:
+                            if m: c["is_master"] = True
+                            if md: c["is_media"] = True
+                            return
+                    candidates.append({
+                        "url": req_url,
+                        "type": "m3u8",
+                        "cache_control": "",
+                        "ct": "",
+                        "is_master": m,
+                        "is_media": md,
+                        "is_ad": is_ad_flag,
+                        "ts": time.time(),
+                    })
                 elif any(domain in req_url for domain in ["youtube.com/embed", "youtu.be", "dailymotion.com/embed", "vimeo.com/video"]):
-                    found_result = {"type": "embed", "url": req_url}
+                    for c in candidates:
+                        if c.get("url") == req_url and c.get("type") == "embed":
+                            return
+                    candidates.append({
+                        "url": req_url,
+                        "type": "embed",
+                        "cache_control": "",
+                        "ct": "",
+                        "is_master": False,
+                        "is_media": False,
+                        "ts": time.time(),
+                    })
 
             def handle_response(response):
-                # Перехват HLS-манифестов по Content-Type.
-                nonlocal found_result
+                # Перехват HLS-манифестов по Content-Type + классификация
+                # master/media по телу. Тело читаем сразу — Playwright
+                # держит его в памяти только внутри обработчика.
+                nonlocal master_seen_ts
                 try:
                     ct = response.headers.get("content-type", "").lower()
                     cc = response.headers.get("cache-control", "") or ""
@@ -606,29 +995,65 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int) -> Opt
                 except Exception:
                     return
 
-                # Никогда не берём сегменты за манифест
                 if any(ext in low for ext in [".ts", ".m4s", ".key", ".aac", ".mp4", ".m4a"]):
                     return
-
                 if not ("mpegurl" in ct or "m3u8" in ct):
                     return
-
-                # Случай 1: URL уже известен из handle_request — обновляем cc.
-                # Это типичный сценарий для tvcdnpotok.com/594/index.m3u8:
-                # handle_request сработал раньше, увидел .m3u8 в URL,
-                # поставил found_result без cc. Теперь ловим настоящий ответ
-                # и записываем Cache-Control от CDN.
-                if found_result is not None:
-                    if (found_result.get("type") == "m3u8"
-                            and found_result.get("url") == url
-                            and not found_result.get("cache_control")):
-                        found_result["cache_control"] = cc
-                        logger.info(f"[SNIFFER] cache-control intercepted: {url} (cc={cc!r})")
+                if url in _skip_urls:
+                    logger.info(f"[SNIFFER] skip_url (previous ad): {url[:120]}")
                     return
+                is_ad_flag = _is_ad_url(url)
+                if is_ad_flag:
+                    logger.info(f"[SNIFFER] ad response (kept for vid-compare): {url[:120]}")
 
-                # Случай 2: раньше не находили (URL без .m3u8) — ставим found_result.
-                found_result = {"type": "m3u8", "url": url, "cache_control": cc}
-                logger.info(f"[SNIFFER] HLS by content-type: {url} (ct={ct}, cc={cc!r})")
+                # Читаем первые 500 байт тела для классификации.
+                # response.body() синхронный и работает только здесь.
+                body_head = ""
+                try:
+                    raw = response.body()
+                    body_head = raw[:500].decode("utf-8", errors="ignore")
+                except Exception:
+                    pass
+
+                is_master = "#EXT-X-STREAM-INF" in body_head
+                is_media = ("#EXTINF" in body_head) and not is_master
+                # hls-classify-by-name-v1: если тело не дало классификации, но
+                # handle_request её уже установил — не сбрасываем.
+                # (body_head может быть пустым из-за ct/размера)
+
+                # Ищем кандидата с тем же URL (мог быть добавлен в handle_request).
+                target = None
+                for c in candidates:
+                    if c.get("url") == url:
+                        target = c
+                        break
+                if target is None:
+                    target = {
+                        "url": url,
+                        "type": "m3u8",
+                        "cache_control": "",
+                        "ct": "",
+                        "is_master": False,
+                        "is_media": False,
+                        "ts": time.time(),
+                    }
+                    candidates.append(target)
+
+                if cc and not target.get("cache_control"):
+                    target["cache_control"] = cc
+                target["ct"] = ct
+                if is_master:
+                    target["is_master"] = True
+                    if master_seen_ts == 0.0:
+                        master_seen_ts = time.time()
+                        logger.info(f"[SNIFFER] master manifest: {url[:120]}")
+                elif is_media:
+                    target["is_media"] = True
+                    logger.info(f"[SNIFFER] media manifest: {url[:120]}")
+                elif not target.get("is_master") and not target.get("is_media"):
+                    # Тело не дало классификации, и handle_request тоже.
+                    # Помечаем как unclassified m3u8 — на самый крайний случай.
+                    target["is_unclassified"] = True
 
             page.on("request", handle_request)
             page.on("response", handle_response)
@@ -641,7 +1066,7 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int) -> Opt
                 page.wait_for_timeout(6000)
 
                 for btn_text in COOKIE_PATTERNS:
-                    if found_result:
+                    if candidates:
                         break
                     try:
                         button = page.get_by_role("button", name=re.compile(btn_text, re.IGNORECASE))
@@ -652,19 +1077,43 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int) -> Opt
                     except Exception:
                         pass
 
-                if not found_result:
+                if not candidates:
                     selectors = ["video", "iframe", ".vjs-big-play-button", "[class*='player']"]
                     for sel in selectors:
                         elem = page.locator(sel)
                         if elem.count() > 0 and elem.first.is_visible():
                             elem.first.click(force=True, timeout=1000)
                             page.wait_for_timeout(1500)
-                            if found_result:
+                            if candidates:
                                 break
 
+                # Ждём до max_timeout. Не выходим по первому master:
+                # реклама идёт первой, эфир — после неё. Нужно собрать
+                # все master'ы, чтобы поймать смену video_id.
                 start_time = time.time()
-                while not found_result and (time.time() - start_time) < max_timeout:
+                while True:
+                    elapsed = time.time() - start_time
+                    has_embed = any(c.get("type") == "embed" for c in candidates)
+                    if has_embed:
+                        break
+                    if elapsed >= max_timeout:
+                        break
                     page.wait_for_timeout(500)
+
+                # Диагностика: печатаем всех кандидатов с video_id
+                for c in candidates:
+                    if c.get("type") == "m3u8":
+                        v = _extract_video_id(c.get("url", ""))
+                        flags = []
+                        if c.get("is_master"): flags.append("master")
+                        if c.get("is_media"): flags.append("media")
+                        if c.get("is_ad"): flags.append("AD")
+                        logger.info(
+                            f"[SNIFFER] candidate vid={v!r} flags={flags}: "
+                            f"{c['url'][:120]}"
+                        )
+
+                found_result = _pick_best_candidate(candidates, channel_name=None)
 
                 if found_result and found_result["type"] == "m3u8":
                     cookies = context.cookies()
@@ -677,6 +1126,8 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int) -> Opt
                     final_url += f"|User-Agent={user_agent}"
 
                     found_result["url"] = final_url
+                elif found_result and found_result["type"] == "embed":
+                    pass  # embed уже готов, заголовки не нужны
 
             except Exception as e:
                 logger.warning(f"[SNIFFER] parse failed: {target_url}: {e}")
@@ -711,15 +1162,6 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int) -> Opt
             pass
 
     return found_result
-
-def resolve_via_browser_sniffer(target_url: str, ua: str = None, max_timeout: int = 15) -> Optional[Dict[str, str]]:
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_run_browser_sniffer_sync, target_url, ua or IPTV_DEFAULT_UA, max_timeout)
-        try:
-            return future.result(timeout=max_timeout + 5)
-        except concurrent.futures.TimeoutError:
-            logger.warning(f"[SNIFFER] timeout: {target_url}")
-            return None
 
 def _resolve_direct(ch):
     url = ch["url"]

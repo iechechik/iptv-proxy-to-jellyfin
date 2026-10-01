@@ -6,9 +6,15 @@ function switchTab(tabId) {
     document.getElementById('tab-' + tabId).classList.add('active');
     document.querySelector(`.tab-link[onclick="switchTab('${tabId}')"]`).classList.add('active');
 
+    // Запоминаем активную вкладку, чтобы F5 не сбрасывал на первую.
+    try { sessionStorage.setItem('activeTab', tabId); } catch (e) {}
+
     if (tabId === 'epg-sources') {
         stopLogAutoRefresh();
         loadEpgSources();
+    } else if (tabId === 'playlist-sources') {
+        stopLogAutoRefresh();
+        if (typeof loadPlaylistSources === 'function') loadPlaylistSources();
     } else if (tabId === 'logs') {
         startLogAutoRefresh();
     } else {

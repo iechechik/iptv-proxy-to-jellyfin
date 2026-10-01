@@ -110,10 +110,34 @@ def _build_stream_response(name: str, request: Request, is_direct: bool, payload
         clean_url, _ = parse_url_headers(payload)
         logger.info(f"[STREAM] '{name}': direct stream, URL={clean_url[:100]}...")
         if ".m3u8" in clean_url.lower():
-            needs_mux_flag = _get_or_compute_needs_mux(name, payload, active_idx)
-            if needs_mux_flag:
-                logger.info(f"[STREAM] '{name}': mux selected, redirecting to /mux/{quote(name)}.ts")
+            # mux-state-v1: mux_state активного stream имеет приоритет
+            # над needs_mux.
+            _mux_state = "auto"
+            _ch_ms = state.get_channel(name)
+            if _ch_ms:
+                _mux_state = _ch_ms.get("mux_state", "auto")
+                if _mux_state not in ("auto", "on", "off"):
+                    _mux_state = "auto"
+            if _mux_state == "on":
+                logger.info(f"[STREAM] '{name}': mux_state=on, mux forced")
                 return RedirectResponse(f"/mux/{quote(name)}.ts", status_code=302)
+            if _mux_state == "off":
+                logger.info(f"[STREAM] '{name}': mux_state=off, skipping mux")
+                # mux-off-kills-v1: убить существующий мукс-процесс,
+                # иначе UI показывает MUX и healthcheck думает, что
+                # канал играет через мукс.
+                try:
+                    from services.mux_service import invalidate_mux
+                    invalidate_mux(name)
+                except Exception as _e:
+                    logger.warning(f"[MUX] '{name}': invalidate on off failed: {_e}")
+                # падаем вниз, отдадим через _build_redirect_response
+            else:
+                # auto — текущее поведение
+                needs_mux_flag = _get_or_compute_needs_mux(name, payload, active_idx)
+                if needs_mux_flag:
+                    logger.info(f"[STREAM] '{name}': mux selected (auto/needs_mux), redirecting to /mux/{quote(name)}.ts")
+                    return RedirectResponse(f"/mux/{quote(name)}.ts", status_code=302)
         if "googlevideo.com" in payload:
             client_ua = request.headers.get("user-agent")
             proxy_response = _proxy_googlevideo_manifest(payload, client_ua)
@@ -286,10 +310,16 @@ def get_m3u(request: Request):
 
 def _override_master_bandwidth(manifest_text: str, bandwidth: int = 3250000) -> str:
     """Принудительно ставит BANDWIDTH в master-плейлист.
-    Jellyfin иначе использует дефолт ~20 Mbps и уходит в транскод.
+
+    master-bandwidth-fix-v1: только если STREAM-INF РОВНО ОДИН.
+    Иначе все варианты качества получают одинаковый BANDWIDTH, и
+    Jellyfin не может выбрать между ними — спотыкается.
     Media-плейлисты (только #EXTINF + .ts) не трогает.
     """
     if "#EXT-X-STREAM-INF" not in manifest_text:
+        return manifest_text
+    # Несколько STREAM-INF — не перезаписываем BANDWIDTH, даём Jellyfin выбор.
+    if manifest_text.count("#EXT-X-STREAM-INF") > 1:
         return manifest_text
     out = []
     for line in manifest_text.splitlines():
@@ -312,12 +342,17 @@ def proxy_hls_manifest(url: str, request: Request, referer: str = None, cookie: 
     if channel:
         state.mark_channel_active(channel)
     try:
-        target_url = unquote(url)
-        headers = {"User-Agent": unquote(ua) if ua else IPTV_DEFAULT_UA}
+        # FastAPI уже декодировал query-параметр. Повторный unquote()
+        # ломает percent-encoding внутри URL: %3A → :, %2B → +.
+        # CDN ожидает исходные %3A/%2B в startdate= — с `+` он читает
+        # как пробел и отдаёт 404.
+        target_url = url
+        # unquote-fix-v1: значения уже декодированы FastAPI.
+        headers = {"User-Agent": ua if ua else IPTV_DEFAULT_UA}
         if referer:
-            headers["Referer"] = unquote(referer)
+            headers["Referer"] = referer
         if cookie:
-            headers["Cookie"] = unquote(cookie)
+            headers["Cookie"] = cookie
 
         req = urllib.request.Request(target_url, headers=headers)
         with urllib.request.urlopen(req, timeout=IPTV_FETCH_TIMEOUT) as resp:
@@ -441,6 +476,95 @@ def proxy_hls_manifest(url: str, request: Request, referer: str = None, cookie: 
         return Response(f"Error proxying playlist: {e}", status_code=502)
 
 
+# segment-head-key-v1
+def _content_type_for_segment(target_url: str) -> str:
+    """Content-Type по расширению target URL.
+
+    Ключ AES-128 (.key) — 16 бинарных байт. ffmpeg ожидает
+    application/octet-stream. video/mp2t для ключа ломает парсер.
+    """
+    u = target_url.lower().split("?")[0]
+    if u.endswith(".key"):
+        return "application/octet-stream"
+    if u.endswith(".m3u8"):
+        return "application/vnd.apple.mpegurl"
+    if u.endswith((".ts", ".m4s", ".mp4", ".m4a", ".aac", ".ac3", ".vtt")):
+        return "video/mp2t"
+    # .mpd, .key, неизвестные — octet-stream безопаснее для бинарных
+    if u.endswith((".mpd", ".key", ".bin")):
+        return "application/octet-stream"
+    return "video/mp2t"
+
+
+# hls-ext-paths-v1
+# Универсальный роут: /hls/{name}.{ext}?url=...&referer=...&cookie=...&ua=...
+# ext определяет Content-Type и поведение (manifest или binary).
+# Старые /hls/manifest.m3u8 и /hls/segment.ts остаются ниже — для кэша.
+
+_MANIFEST_EXTS = ("m3u8", "mpd")
+_BINARY_EXTS = ("ts", "m4s", "mp4", "m4a", "aac", "ac3", "vtt", "key", "bin")
+
+
+@router.head("/hls/{name}.{ext}")
+def proxy_hls_by_ext_head(name: str, ext: str, url: str, request: Request,
+                          referer: str = None, cookie: str = None,
+                          ua: str = None, channel: str = None):
+    ext_l = ext.lower()
+    if ext_l == "key":
+        ct = "application/octet-stream"
+    elif ext_l == "vtt":
+        ct = "text/vtt"
+    elif ext_l in _MANIFEST_EXTS:
+        ct = "application/vnd.apple.mpegurl"
+    elif ext_l in _BINARY_EXTS:
+        ct = "video/mp2t"
+    else:
+        ct = "application/octet-stream"
+    return Response(status_code=200, media_type=ct,
+                    headers={"Accept-Ranges": "bytes"})
+
+
+@router.get("/hls/{name}.{ext}")
+def proxy_hls_by_ext(name: str, ext: str, url: str, request: Request,
+                     referer: str = None, cookie: str = None,
+                     ua: str = None, channel: str = None):
+    """Универсальный HLS-прокси. ext в пути — правильное расширение URL.
+
+    Для .m3u8/.mpd — проксируем манифест (переписываем вложенные URL).
+    Для .ts/.key/.vtt/.m4s/.mp4 — отдаём бинарь как есть.
+    """
+    if not channel:
+        channel = name
+    ext_l = ext.lower()
+    if ext_l in _MANIFEST_EXTS:
+        return proxy_hls_manifest(url=url, request=request, referer=referer,
+                                  cookie=cookie, ua=ua, channel=channel)
+    # бинарь: key/vtt/segment
+    return proxy_hls_segment(url=url, request=request, referer=referer,
+                             cookie=cookie, ua=ua, channel=channel)
+
+
+@router.head("/hls/segment.ts")
+def proxy_hls_segment_head(url: str, request: Request,
+                          referer: str = None, cookie: str = None,
+                          ua: str = None, channel: str = None):
+    """HEAD для /hls/segment.ts.
+
+    ffmpeg/ffprobe делают HEAD перед GET для определения размера и
+    типа. Раньше возвращали 405, и ffmpeg отказывался открывать ключ.
+    Отвечаем 200 без тела — с корректным Content-Type по расширению.
+    """
+    # url — сырой query-параметр (FastAPI декодировал). Проверим только
+    # расширение, содержимое не качаем.
+    target_url = url
+    ct = _content_type_for_segment(target_url)
+    return Response(
+        status_code=200,
+        media_type=ct,
+        headers={"Accept-Ranges": "bytes"},
+    )
+
+
 @router.get("/hls/segment.ts")
 def proxy_hls_segment(
     url: str,
@@ -457,7 +581,12 @@ def proxy_hls_segment(
         if cookie in ("None", "null", ""): cookie = None
         if ua in ("None", "null", ""): ua = None
         if referer in ("None", "null", ""): referer = None
-        target_url = unquote(url)
+        # unquote-fix-v1: FastAPI уже декодировал query-параметр.
+        # Повторный unquote ломает %2B -> '+' -> ' ' (пробел), CDN 404.
+        target_url = url
+        # segment-head-key-v1: Content-Type по расширению. Для .key —
+        # application/octet-stream, иначе ffmpeg не распарсит ключ AES-128.
+        _ct = _content_type_for_segment(target_url)
         try:
             cached = get_cached_segment(target_url)
             if cached is not None:
@@ -524,13 +653,11 @@ def proxy_hls_segment(
                     else:
                         raise
         except urllib.error.HTTPError as e:
-            if e.code in (403, 404):
-                logger.info(f"[TS-PROXY] [{channel or '?'}] direct access {e.code}, FlareSolverr: {target_url[:120]}")
-                with flaresolverr_sem:
-                    raw = fetch_via_flaresolverr(target_url, headers, IPTV_FETCH_TIMEOUT)
-                elapsed = time.time() - t0
-                logger.info(f"[TS-PROXY] [{channel or '?'}] FlareSolverr: {len(raw)} bytes in {elapsed:.2f}s")
-                return Response(content=raw, media_type="video/mp2t")
+            # remove-flare-from-segments-v1:
+            # FlareSolverr убран из прокси сегментов/ключей. Он возвращает
+            # solution.response как UTF-8 строку — бинарные TS и ключи
+            # портятся. Плюс запускает Chromium на каждый сегмент.
+            # Уместен только в резолвере (поиск m3u8 на HTML-странице).
             logger.error(f"[TS-PROXY] [{channel or '?'}] HTTP {e.code}: {target_url[:120]}")
             return Response(f"Upstream error: {e.code}", status_code=502)
         except Exception as e:
@@ -551,9 +678,25 @@ def proxy_hls_segment(
             f"in {elapsed:.2f}s: {target_url[:100]}"
         )
         response_headers["Content-Length"] = str(len(data))
+        # segment-head-key-v1: если upstream отдал text/plain или пусто —
+        # не доверяем ему, ставим свой Content-Type по расширению.
+        # Для .key upstream часто отдаёт application/octet-stream — тогда
+        # берём его. Иначе — наш _ct.
+        # force-key-ct-v1: для .key ВСЕГДА наш application/octet-stream.
+        # Pluto (и, возможно, другие) отдаёт для ключа Content-Type
+        # application/vnd.apple.mpegurl — это неверно, ffmpeg ломается.
+        _is_key = target_url.lower().split("?")[0].endswith(".key")
+        if _is_key:
+            _final_ct = "application/octet-stream"
+        else:
+            _upstream_ct = content_type or ""
+            if _upstream_ct.startswith("video/") or _upstream_ct.startswith("application/"):
+                _final_ct = _upstream_ct
+            else:
+                _final_ct = _ct
         return Response(
             content=data,
-            media_type=content_type,
+            media_type=_final_ct,
             status_code=status_code,
             headers=response_headers,
         )
@@ -636,12 +779,19 @@ async def mux_stream(name: str, request: Request):
         audio_url = None
         max_bw = -1
 
-        for line in lines:
-            if line.strip().startswith("#EXT-X-MEDIA") and "TYPE=AUDIO" in line:
-                m = re.search(r'URI="([^"]+)"', line)
-                if m:
-                    audio_url = urljoin(clean_url, m.group(1))
-                    break
+        # mux-all-v1: если в master нет #EXT-X-MEDIA:TYPE=AUDIO —
+        # single-input режим (video_url сам содержит A+V).
+        has_audio_group = any(
+            line.strip().startswith("#EXT-X-MEDIA") and "TYPE=AUDIO" in line
+            for line in lines
+        )
+        if has_audio_group:
+            for line in lines:
+                if line.strip().startswith("#EXT-X-MEDIA") and "TYPE=AUDIO" in line:
+                    m = re.search(r'URI="([^"]+)"', line)
+                    if m:
+                        audio_url = urljoin(clean_url, m.group(1))
+                        break
 
         for i, line in enumerate(lines):
             if line.strip().startswith("#EXT-X-STREAM-INF"):
@@ -654,10 +804,11 @@ async def mux_stream(name: str, request: Request):
                             max_bw = bw
                             video_url = urljoin(clean_url, candidate)
 
-        if not video_url or not audio_url:
-            return Response("Cannot find video/audio in master", status_code=404)
+        # mux-all-v1: video обязателен, audio — опционально (single-input).
+        if not video_url:
+            return Response("Cannot find video in master", status_code=404)
 
-        logger.info(f"[MUX] '{name}': video={video_url[:80]}, audio={audio_url[:80]}")
+        logger.info(f"[MUX] '{name}': video={video_url[:80]}, audio={(audio_url or '(none)')[:80]}")
         mux_proc = get_or_create_mux(name, video_url, audio_url, user_agent, referer_str, cookie_str)
 
     # q инициализируем None: если subscribe() упадёт, finally не сломается

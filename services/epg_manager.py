@@ -4,6 +4,8 @@ import sqlite3
 import threading
 import time
 
+# epg-prune-v1
+# prune-vacuum-v4
 logger = logging.getLogger("iptv-proxy")
 
 
@@ -11,7 +13,9 @@ class EPGManager:
     def __init__(self, db_path: str):
         self.db_path = db_path
         # Отдельная блокировка только для операций записи (импорт/инициализация)
-        self._write_lock = threading.Lock()
+        # prune-vacuum-v4: RLock, чтобы prune_old_programmes внутри
+        # import_source (тоже под _write_lock) не дедлочил.
+        self._write_lock = threading.RLock()
         # Для чтения блокировка не нужна: WAL позволяет читать параллельно с записью
         self.source_priority = []  # список имён источников по убыванию приоритета
         self._init_db()
@@ -40,14 +44,24 @@ class EPGManager:
                         PRIMARY KEY (source, id)
                     )
                 """)
+                # epg-prune-v1: start_time — unix timestamp начала программы,
+                # нужен для prune старых. При миграции существующей БД —
+                # ALTER TABLE ADD COLUMN (не заполняет старые записи, они
+                # получат start_time при следующем переимпорте источника).
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS programmes (
                         source TEXT NOT NULL,
                         channel_id TEXT NOT NULL,
-                        xml_data TEXT NOT NULL
+                        xml_data TEXT NOT NULL,
+                        start_time INTEGER
                     )
                 """)
+                try:
+                    conn.execute("ALTER TABLE programmes ADD COLUMN start_time INTEGER")
+                except sqlite3.OperationalError:
+                    pass  # колонка уже есть
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_programmes_source_channel ON programmes(source, channel_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_programmes_start_time ON programmes(start_time)")
 
     def maintenance(self):
         try:
@@ -158,9 +172,11 @@ class EPGManager:
                                     programme_channel_ids.add(ch_id)
                                     programme_count += 1
                                     xml_str = ET.tostring(elem, encoding="unicode")
+                                    # epg-prune-v1: start_time для prune.
+                                    _start_ts = self._parse_xmltv_time(elem.get("start", ""))
                                     conn.execute(
-                                        "INSERT INTO programmes (source, channel_id, xml_data) VALUES (?, ?, ?)",
-                                        (source_name, ch_id, xml_str)
+                                        "INSERT INTO programmes (source, channel_id, xml_data, start_time) VALUES (?, ?, ?, ?)",
+                                        (source_name, ch_id, xml_str, _start_ts)
                                     )
                                 root.clear()
 
@@ -199,6 +215,69 @@ class EPGManager:
                     except Exception:
                         conn.rollback()
                         raise
+            # prune-vacuum-v4: prune старых programmes (7+ дней) после
+            # каждого успешного импорта. _write_lock — RLock, вызов
+            # безопасен (мы внутри того же лока).
+            try:
+                self.prune_old_programmes(days=7)
+            except Exception as _e:
+                logger.warning(f"[EPG] prune after import failed: {_e}")
+
+    # epg-prune-v1
+    def _parse_xmltv_time(self, s: str) -> int:
+        """XMLTV time: '20261001120000 +0300' → unix ts. 0 при ошибке."""
+        if not s or len(s) < 14:
+            return 0
+        try:
+            from datetime import datetime, timezone, timedelta
+            dt = datetime.strptime(s[:14], "%Y%m%d%H%M%S")
+            rest = s[14:].strip()
+            tz_off = 0
+            if rest and rest[0] in "+-" and len(rest) >= 5:
+                sign = 1 if rest[0] == "+" else -1
+                hh = int(rest[1:3]); mm = int(rest[3:5])
+                tz_off = sign * (hh * 3600 + mm * 60)
+            return int(dt.replace(tzinfo=timezone(timedelta(seconds=tz_off))).timestamp())
+        except Exception:
+            return 0
+
+    def prune_old_programmes(self, days: int = 7) -> int:
+        """Удаляет programmes с start_time < now - days*86400.
+        Записи без start_time (0) сохраняются до следующего переимпорта."""
+        cutoff = int(time.time()) - days * 86400
+        with self._write_lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "DELETE FROM programmes WHERE start_time IS NOT NULL AND start_time > 0 AND start_time < ?",
+                    (cutoff,)
+                )
+                removed = cur.rowcount
+                conn.commit()
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        if removed:
+            logger.info(f"[EPG] pruned {removed} programmes older than {days} days")
+        return removed
+
+    def vacuum(self) -> None:
+        """Сжатие БД: VACUUM + wal_checkpoint."""
+        import os
+        try:
+            size_before = os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
+        except Exception:
+            size_before = 0
+        try:
+            with self._write_lock:
+                with self._connect() as conn:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    conn.execute("VACUUM")
+            try:
+                size_after = os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
+            except Exception:
+                size_after = 0
+            delta_mb = (size_before - size_after) / 1024 / 1024
+            logger.info(f"[EPG] vacuum done: {size_before/1024/1024:.1f} MB → {size_after/1024/1024:.1f} MB (freed {delta_mb:.1f} MB)")
+        except Exception as e:
+            logger.warning(f"[EPG] vacuum failed: {e}")
 
     def get_channels(self) -> dict:
         result = {}

@@ -509,6 +509,38 @@ def parse_epg_sources(raw: str) -> list:
         })
     return sources
 
+def get_playlist_sources():
+    """Список активных источников M3U-плейлистов для поиска каналов.
+
+    По аналогии с get_epg_sources: читаем из config.json, отбрасываем
+    disable. Нормализация минимальная — url, name, interval.
+
+    Не подтягиваем ничего при старте — это только список источников,
+    которые пользователь включил в UI.
+    """
+    if CONFIG_DATA and isinstance(CONFIG_DATA.get("playlist_sources"), list):
+        sources = []
+        for src in CONFIG_DATA["playlist_sources"]:
+            if not isinstance(src, dict):
+                continue
+            url = src.get("url", "").strip()
+            if not url:
+                continue
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url.lstrip("/")
+            name = src.get("name", url)
+            interval = parse_interval(src.get("interval", "24h"))
+            disable = src.get("disable", False)
+            sources.append({
+                "name": name,
+                "url": url,
+                "interval": interval,
+                "disable": disable,
+            })
+        return sources
+    return []
+
+
 def get_epg_sources():
     if CONFIG_DATA and isinstance(CONFIG_DATA.get("epg", {}).get("sources"), list):
         sources = []
@@ -687,6 +719,10 @@ def save_full_config(channels: list = None) -> bool:
                 stream_entry["disable"] = True
             if s.get("prefetch", False):
                 stream_entry["prefetch"] = True
+            # mux-state-v1: сохраняем mux_state, если не "auto".
+            _ms = s.get("mux_state", "auto")
+            if _ms in ("on", "off"):
+                stream_entry["mux_state"] = _ms
             if not stream_entry["ua"]:
                 stream_entry.pop("ua", None)
             normalized_streams.append(stream_entry)
@@ -702,9 +738,32 @@ def save_full_config(channels: list = None) -> bool:
 
     CONFIG_DATA["channels"] = cleaned_channels
 
+    # === playlist_sources ===
+    raw_playlist_sources = CONFIG_DATA.get("playlist_sources", [])
+    playlist_sources_clean = []
+    if isinstance(raw_playlist_sources, list):
+        for src_raw in raw_playlist_sources:
+            if not isinstance(src_raw, dict):
+                continue
+            url = src_raw.get("url", "").strip()
+            if not url:
+                continue
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url.lstrip("/")
+            out = {
+                "name": src_raw.get("name", url),
+                "url": url,
+                "interval": src_raw.get("interval", 86400),
+            }
+            if src_raw.get("disable", False):
+                out["disable"] = True
+            playlist_sources_clean.append(out)
+    CONFIG_DATA["playlist_sources"] = playlist_sources_clean
+
     # Формируем итоговый конфиг с явным порядком секций
     ordered_config = {
         "epg": CONFIG_DATA.get("epg"),
+        "playlist_sources": CONFIG_DATA.get("playlist_sources"),
         "server": CONFIG_DATA.get("server"),
         "jellyfin": CONFIG_DATA.get("jellyfin"),
         "resolver": CONFIG_DATA.get("resolver"),

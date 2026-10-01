@@ -96,9 +96,11 @@ def update_all_sources():
 
 def periodic_epg_update():
     """
-    Периодически проверяет каждый источник по его интервалу.
-    Если задан IPTV_EPG_UPDATE_TIME, дополнительно раз в сутки
-    в это время выполняется полное обновление всех источников.
+    epg-schedule-v2:
+      - Каждый источник обновляется по своему интервалу (src["interval"]).
+      - last_update берётся из meta.updated_at (переживает рестарт).
+      - Пустая БД → last_update=0 → импорт сразу.
+      - IPTV_EPG_UPDATE_TIME — время VACUUM (раз в сутки), не импорта.
     """
     # Инициализируем время последнего обновления из БД, чтобы не качать всё заново
     last_update = {}
@@ -106,8 +108,9 @@ def periodic_epg_update():
         name = src.get("name", src["url"])
         last_update[name] = epg_manager.get_source_updated_at(name) or 0
 
-    # Рассчитываем время следующего «ночного» обновления
-    next_daily_run = None
+    # epg-schedule-v2: IPTV_EPG_UPDATE_TIME → время VACUUM (раз в сутки).
+    # Больше не "ночное обновление всех" — обновления только по интервалам.
+    next_vacuum_run = None
     if cfg.IPTV_EPG_UPDATE_TIME:
         try:
             hour, minute = map(int, cfg.IPTV_EPG_UPDATE_TIME.split(":"))
@@ -115,8 +118,8 @@ def periodic_epg_update():
             candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
             if candidate <= now:
                 candidate += datetime.timedelta(days=1)
-            next_daily_run = candidate
-            logger.info(f"[EPG] nightly update scheduled at {next_daily_run.strftime('%Y-%m-%d %H:%M:%S')}")
+            next_vacuum_run = candidate
+            logger.info(f"[EPG] vacuum scheduled at {next_vacuum_run.strftime('%Y-%m-%d %H:%M:%S')}")
         except Exception:
             logger.error(f"[EPG] invalid IPTV_EPG_UPDATE_TIME format: {cfg.IPTV_EPG_UPDATE_TIME}")
 
@@ -127,21 +130,15 @@ def periodic_epg_update():
             now = time.time()
             need_update = False
 
-            # 1) Ночное обновление всех источников
-            if next_daily_run and datetime.datetime.now() >= next_daily_run:
-                logger.info("[EPG] nightly update time reached, updating all sources")
-                for src in cfg.IPTV_EPG_SOURCES:
-                    if not _epg_update_lock.acquire(blocking=False):
-                        continue
-                    try:
-                        download_and_import_source(src)
-                        last_update[src.get("name", src["url"])] = now
-                    except Exception as e:
-                        logger.error(f"[EPG] source {src.get('url')} skipped due to error: {e}")
-                    finally:
-                        _epg_update_lock.release()
-                need_update = True
-                next_daily_run += datetime.timedelta(days=1)
+            # epg-schedule-v2: вместо "ночного обновления всех" — VACUUM.
+            # Раз в сутки, в IPTV_EPG_UPDATE_TIME. Импорты — только по интервалам.
+            if next_vacuum_run and datetime.datetime.now() >= next_vacuum_run:
+                logger.info("[EPG] scheduled vacuum starting")
+                try:
+                    epg_manager.vacuum()
+                except Exception as e:
+                    logger.warning(f"[EPG] scheduled vacuum failed: {e}")
+                next_vacuum_run += datetime.timedelta(days=1)
 
             # 2) Интервальные обновления
             for src in cfg.IPTV_EPG_SOURCES:

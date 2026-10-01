@@ -805,12 +805,69 @@ _TMP_CLEANUP_INTERVAL_SEC = 600  # 10 минут
 _last_tmp_cleanup = 0.0
 
 
+def _kill_stale_chromium(max_age_sec: int = 90):
+    """Убивает зависшие процессы Chromium/headless_shell старше max_age_sec.
+
+    Playwright запускает Chromium в headless-режиме (headless_shell)
+    или системный chromium. При зависании sniffer'а (баг Playwright,
+    зацикливание JS-челленджа) процесс остаётся навсегда — плодятся
+    зомби, съедают память, следующий sniffer не находит свободный порт.
+
+    Правило простое: sniffer НЕ должен работать дольше
+    navigation_timeout (20) + wait (15) + закрытие (5) = 40 сек.
+    Порог 90 сек с запасом: живой sniffer никогда не дотянет до него.
+
+    Убиваем по возрасту (etime), не по имени — чтобы не задеть
+    уже закрывающиеся процессы.
+    """
+    import subprocess as _sp
+    import time as _t
+    killed = 0
+    patterns = ("headless_shell", "chrome", "chromium")
+    try:
+        # ps -eo pid,etimes,comm,args — etimes = elapsed seconds
+        out = _sp.run(
+            ["ps", "-eo", "pid=,etimes=,comm=,args="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception as e:
+        logger.warning(f"[CLEANUP] ps failed: {e}")
+        return
+    for line in out.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[0])
+            etimes = int(parts[1])
+        except ValueError:
+            continue
+        comm = parts[2]
+        args = parts[3]
+        if not any(p in comm or p in args for p in patterns):
+            continue
+        # Исключаем сам этот python-процесс (в args будет 'chromium'
+        # как подстрока, если мы его ищем в коде — но тут args реальные).
+        if etimes < max_age_sec:
+            continue
+        try:
+            import os as _os
+            import signal as _sig
+            _os.kill(pid, _sig.SIGKILL)
+            killed += 1
+        except Exception:
+            pass
+    if killed:
+        logger.warning(f"[CLEANUP] killed {killed} stale chromium process(es) (> {max_age_sec}s)")
+
+
 def background_cleanup():
     global _last_tmp_cleanup
     while True:
         time.sleep(60)
         state.cleanup_expired_caches()
         cleanup_expired_segments()
+        _kill_stale_chromium(max_age_sec=90)
         # Чистка /tmp — реже, чем раз в 60 сек. glob по сотням файлов
         # на каждой итерации даёт лишний CPU. 10 минут более чем
         # достаточно: артефакты sniffer и так удаляются с порогом 1 час,

@@ -221,6 +221,14 @@ def load_channels():
 
                 first = streams[active_index]
 
+                # mux-state-v1: mux_state на активном stream (auto|on|off).
+                # Берём из first, но при переключении active_index в
+                # load_channels пересчитывается first — значит всегда
+                # актуально для выбранного stream.
+                _mux_state = first.get("mux_state", "auto")
+                if _mux_state not in ("auto", "on", "off"):
+                    _mux_state = "auto"
+
                 channels.append({
                     "name": name,
                     "chno": chno,
@@ -237,7 +245,8 @@ def load_channels():
                     "active_stream_index": active_index,
                     "fallback": ch_cfg.get("fallback", False),
                     "prefetch": first.get("prefetch", False),
-                    "comment": ch_cfg.get("comment", "")
+                    "comment": ch_cfg.get("comment", ""),
+                    "mux_state": _mux_state,
                 })
             _channels_memory = channels
             logger.info(f"[STATE] loaded {len(channels)} channels from config.json")
@@ -645,6 +654,9 @@ def set_active_stream_index(name: str, new_index: int):
                     ch["resolver"] = first.get("resolver", "auto")
                     ch["ua"] = first.get("ua", IPTV_DEFAULT_UA)
                     ch["fs_regex"] = first.get("fs_regex", "")
+                    # mux-state-v1: обновить mux_state активного stream.
+                    _ms = first.get("mux_state", "auto")
+                    ch["mux_state"] = _ms if _ms in ("auto", "on", "off") else "auto"
                 invalidate_channels_cache()
                 save_channels_to_file(channels)
                 break
