@@ -103,6 +103,14 @@ IPTV_FLARESOLVERR_URL = os.getenv("IPTV_FLARESOLVERR_URL", "http://flaresolverr:
 IPTV_JELLYFIN_URL = os.environ.get("IPTV_JELLYFIN_URL", "http://jellyfin:8096").rstrip("/")
 IPTV_JELLYFIN_API_KEY = os.environ.get("IPTV_JELLYFIN_API_KEY", "").strip()
 IPTV_JELLYFIN_XMLTV_CACHE_DIR = os.getenv("IPTV_JELLYFIN_XMLTV_CACHE_DIR", "/jellyfin-xmltv-cache")
+# mediainfo-cache-dir-v1
+# Путь к mediainfo-кэшу Jellyfin. Мы удаляем оттуда файлы, когда
+# меняется режим доставки канала (mux_state / active_stream_index /
+# url / resolver активного потока). Jellyfin при первом probe канала
+# сохраняет туда Container (hls|ts) и при последующих открытиях
+# не перепроверяет. Если канал сменил режим HLS ↔ raw TS, старый файл
+# ломает воспроизведение (ffmpeg exit 183 - Invalid data found).
+IPTV_JELLYFIN_MEDIAINFO_DIR = os.getenv("IPTV_JELLYFIN_MEDIAINFO_DIR", "/jellyfin-mediainfo-cache")
 IPTV_JELLYFIN_API_TIMEOUT = int(os.getenv("IPTV_JELLYFIN_API_TIMEOUT", "15"))
 
 IPTV_LOG_LEVEL = os.getenv("IPTV_LOG_LEVEL", "info").upper()
@@ -111,6 +119,10 @@ IPTV_LOG_DIR = os.getenv("IPTV_LOG_DIR", "/app/logs")
 IPTV_LOG_CAPACITY = int(os.getenv("IPTV_LOG_CAPACITY", "2000"))
 IPTV_LOG_MAX_BYTES = int(os.getenv("IPTV_LOG_MAX_BYTES", "5242880"))   # 5 МБ
 IPTV_LOG_BACKUP_COUNT = int(os.getenv("IPTV_LOG_BACKUP_COUNT", "3"))
+# channel-events-log-v1
+# Отдельный журнал событий каналов: cfg (конфигурация) и state (состояние).
+# Ротация — как у основного лога (IPTV_LOG_MAX_BYTES, IPTV_LOG_BACKUP_COUNT).
+IPTV_CHANNEL_EVENTS_LOG = os.getenv("IPTV_CHANNEL_EVENTS_LOG", "/app/logs/channel_events.log")
 
 IPTV_ANALYTICS_ENABLED = os.getenv("IPTV_ANALYTICS_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 IPTV_ANALYTICS_INTERVAL = int(os.getenv("IPTV_ANALYTICS_INTERVAL", "3600"))
@@ -280,6 +292,7 @@ if CONFIG_DATA:
     IPTV_JELLYFIN_URL = get_config_value("jellyfin", "url", IPTV_JELLYFIN_URL)
     IPTV_JELLYFIN_API_KEY = get_config_value("jellyfin", "api_key", IPTV_JELLYFIN_API_KEY)
     IPTV_JELLYFIN_XMLTV_CACHE_DIR = get_config_value("jellyfin", "xmltv_cache_dir", IPTV_JELLYFIN_XMLTV_CACHE_DIR)
+    IPTV_JELLYFIN_MEDIAINFO_DIR = get_config_value("jellyfin", "mediainfo_cache_dir", IPTV_JELLYFIN_MEDIAINFO_DIR)
     IPTV_JELLYFIN_API_TIMEOUT = get_config_value("jellyfin", "api_timeout", IPTV_JELLYFIN_API_TIMEOUT)
 
     IPTV_LOG_LEVEL =  get_config_value("logging", "level", IPTV_LOG_LEVEL).upper()
@@ -287,6 +300,7 @@ if CONFIG_DATA:
     IPTV_LOG_CAPACITY = get_config_value("logging", "capacity", IPTV_LOG_CAPACITY)
     IPTV_LOG_MAX_BYTES = get_config_value("logging", "max_bytes", IPTV_LOG_MAX_BYTES)
     IPTV_LOG_BACKUP_COUNT = get_config_value("logging", "backup_count", IPTV_LOG_BACKUP_COUNT)
+    IPTV_CHANNEL_EVENTS_LOG = get_config_value("logging", "channel_events_log", IPTV_CHANNEL_EVENTS_LOG)
 
     IPTV_ANALYTICS_ENABLED = get_config_value("analytics", "enabled", False)
     IPTV_ANALYTICS_INTERVAL = get_config_value("analytics", "interval", 3600)
@@ -614,6 +628,7 @@ def save_full_config(channels: list = None) -> bool:
         "url": IPTV_JELLYFIN_URL,
         # API-KEY не сохраняем, значение read-only из ENV
         "xmltv_cache_dir": IPTV_JELLYFIN_XMLTV_CACHE_DIR,
+        "mediainfo_cache_dir": IPTV_JELLYFIN_MEDIAINFO_DIR,
         "api_timeout": IPTV_JELLYFIN_API_TIMEOUT,
     }
     CONFIG_DATA["resolver"] = {

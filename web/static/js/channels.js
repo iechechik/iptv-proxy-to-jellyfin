@@ -212,6 +212,21 @@ function selectChannel(tvgId, primaryName, sourceName) {
     showToast('EPG выбран. Нажмите "Применить изменения" для сохранения.');
 }
 
+// prefetch-visibility-v1
+// Prefetch применим только если:
+//   - resolver не direct (direct → Jellyfin ходит на CDN, минуя наш прокси);
+//   - mux_state не on (мукс сам качает сегменты);
+//   - не (auto + needs_mux=True) (мукс включится автоматически).
+function isPrefetchApplicable(stream) {
+    if (!stream) return false;
+    const resolver = (stream.resolver || 'auto').toLowerCase();
+    if (resolver === 'direct') return false;
+    const muxState = stream.mux_state || 'auto';
+    if (muxState === 'on') return false;
+    if (muxState === 'auto' && stream.needs_mux === true) return false;
+    return true;
+}
+
 // === Потоки: модальное окно ===
 function openStreamsModal() {
     document.getElementById('streamsChannelName').textContent = document.getElementById('editName').value || document.getElementById('settingsChannelName').textContent;
@@ -248,7 +263,13 @@ function saveStreamsFromModal() {
             fs_regex: item.querySelector('.stream-fs-regex').value,
             disable: disableCb ? disableCb.checked : false,
             stream_id: Number.isFinite(sid) && sid > 0 ? sid : null,
-            prefetch: item.querySelector('.stream-prefetch')?.checked || false,
+            // prefetch-visibility-v1: если чекбокс скрыт (неприменим),
+            // сохраняем прежнее значение, а не сбрасываем в false.
+            prefetch: (() => {
+                const cb = item.querySelector('.stream-prefetch');
+                if (cb) return !!cb.checked;
+                return !!(oldStream.prefetch);
+            })(),
             mux_state: item.querySelector('.stream-mux-state')?.value || 'auto',
             cached_stream: urlChanged ? '' : (oldStream.cached_stream || ''),
             cache_expire: urlChanged ? 0 : (oldStream.cache_expire || 0),
@@ -319,10 +340,11 @@ function addStreamFieldToDOM(stream, index) {
                 <input type="checkbox" ${stream.disable ? 'checked' : ''} onchange="setStreamDisable(${index}, this.checked)">
                 Отключить
             </label>
+            ${isPrefetchApplicable(stream) ? `
             <label style="display: flex; align-items: center; gap: 4px; font-size: 13px; color: var(--text-muted);" title="Фоновая подкачка HLS-сегментов">
                 <input type="checkbox" class="stream-prefetch" ${stream.prefetch ? 'checked' : ''}>
                 Prefetch
-            </label>
+            </label>` : ''}
             <label style="display: flex; align-items: center; gap: 4px; font-size: 13px; color: var(--text-muted);" title="auto — по needs_mux; on — всегда мукс; off — никогда">
                 mux:
                 <select class="stream-mux-state" style="background: var(--bg-color); border: 1px solid var(--border-color); color: var(--text-main); padding: 4px 6px; border-radius: 6px; font-size: 12px;">

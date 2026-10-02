@@ -1,4 +1,4 @@
-from routers import system, web, stream, channels, epg, jellyfin, playlists
+from routers import system, web, stream, stream_hls, stream_mux, channels, channels_checks, channels_resolvers, epg, jellyfin, playlists
 
 import os
 import asyncio
@@ -23,7 +23,11 @@ app = FastAPI()
 app.include_router(system.router)
 app.include_router(web.router)
 app.include_router(stream.router)
+app.include_router(stream_hls.router)
+app.include_router(stream_mux.router)
 app.include_router(channels.router)
+app.include_router(channels_checks.router)
+app.include_router(channels_resolvers.router)
 app.include_router(epg.router)
 app.include_router(jellyfin.router)
 app.include_router(playlists.router)

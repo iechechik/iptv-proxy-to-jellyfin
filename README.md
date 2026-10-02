@@ -35,6 +35,8 @@ FastAPI-сервис, который отдаёт Jellyfin'у IPTV-каналы 
 - **Внешние M3U-плейлисты** — поиск каналов по публичным плейлистам
   (GitHub и т.п.) прямо из модалки потоков. Найденный URL можно проверить
   одной кнопкой и подставить в поток канала.
+- **Журнал событий каналов** — отдельный текстовый лог изменений
+  (конфигурация + переходы UP/DOWN). См. раздел «Журнал событий каналов».
 - **EPG prune + VACUUM** — старые программы (7+ дней) удаляются после
   каждого успешного импорта источника; БД сжимается (`VACUUM`) раз в
   сутки в `IPTV_EPG_UPDATE_TIME`. `meta.updated_at` переживает рестарт —
@@ -156,7 +158,8 @@ json
             "url": "https://site.example/watch",
             "resolver": "auto",
             "ua": "Mozilla/5.0 ...",
-            "mux_state": "auto"
+            "mux_state": "auto",
+            "stream_id": 3918603096042605
         }
     ],
     "fallback": true
@@ -168,6 +171,11 @@ auto | direct | yt-dlp | streamlink
 flaresolverr_simple | flaresolverr_session | sniffer
 auto перебирает резолверы по порядку из секции resolver.order, пока
 один не сработает. Конкретное имя заставляет использовать только его.
+
+Поле stream_id — внутренний идентификатор потока (52-битное число).
+Назначается автоматически при добавлении/сохранении. Нужен, чтобы слоты
+streams_cache не теряли привязку при переупорядочивании потоков. Руками
+трогать не надо.
 
 Ручное управление муксом (mux_state)
 Флаг mux_state живёт на уровне потока (streams[i].mux_state).
@@ -182,14 +190,68 @@ off	Принудительно без мукс. Удобно, когда мук�
 Ставится из UI: канал → модалка → 🎬 Управление потоками → селект mux:
 рядом с Prefetch. Или напрямую в config.json.
 
-Замечание про on: работает только для потоков, где Jellyfin-ffmpeg
-корректно читает TS, отданный муксом. Для обычных HLS-каналов (Euronews,
-Deutsche Welle, ivi/НТВ) mux_state=on ломает воспроизведение —
-Jellyfin ставит -f hls, а получает raw TS. Для них — auto или off.
+Замечание про on: работает для любого потока, где Jellyfin-ffmpeg
+успешно читает raw TS от мукса. При смене mux_state (auto ↔ on ↔ off),
+active_stream_index, url или resolver активного потока iptv-proxy
+автоматически удаляет mediainfo-кэш Jellyfin для этого канала, поэтому
+перезагрузка Jellyfin не нужна и «залипания» старого режима не происходит
+(см. раздел «mediainfo-кэш Jellyfin» ниже).
 
 Замечание про off: если канал имеет #EXT-X-MEDIA:TYPE=AUDIO
 (раздельные дорожки), Jellyfin не сможет их смикшировать сам —
 будет без звука или упадёт. Для таких каналов — auto или on.
+
+Журнал событий каналов
+Отдельный текстовый лог с историей изменений: logs/channel_events.log.
+Формат построчный, читается через tail -f:
+
+text
+2026-10-02 18:15:23 [НТВ] cfg: stream#1 (ivi.ru/...) mux_state: auto -> on (ui)
+2026-10-02 18:16:01 [SkyNews] state: UP -> DOWN (healthcheck)
+2026-10-02 18:17:44 [Euronews] state: DOWN -> UP (ui)
+Префикс cfg: — конфигурационные изменения (пользователь через UI
+или авто-подбор EPG). Префикс state: — переходы состояния канала
+(UP/DOWN, автоматические переключения активного потока).
+В скобках в конце — источник: ui, healthcheck, fallback,
+startup, auto_match.
+
+Ротация — те же параметры, что у основных логов
+(IPTV_LOG_MAX_BYTES, IPTV_LOG_BACKUP_COUNT).
+
+Путь к файлу: IPTV_CHANNEL_EVENTS_LOG (env) или
+config.json → logging.channel_events_log. По умолчанию —
+/app/logs/channel_events.log.
+
+mediainfo-кэш Jellyfin
+Jellyfin при первом probe канала сохраняет в cache/mediainfo/*.json
+информацию о контейнере (Container: hls или Container: ts).
+При последующих открытиях канала он не делает probe заново, а
+использует закэшированный формат.
+
+Если канал сменил режим доставки (HLS ↔ raw TS через мукс) — старый
+кэш ломает воспроизведение (Jellyfin-ffmpeg падает с exit 183
+«Invalid data found when processing input»).
+
+Решение: iptv-proxy автоматически удаляет mediainfo-кэш Jellyfin
+для канала при изменении:
+
+mux_state активного потока (auto ↔ on ↔ off),
+
+active_stream_index,
+
+url активного потока,
+
+resolver активного потока.
+
+При следующем открытии канала Jellyfin делает свежий probe и
+корректно определяет формат. Перезагрузка Jellyfin не нужна.
+
+Требуется монтирование в docker-compose.yaml:
+
+yaml
+- /opt/docker-compose/configs/jellyfin/cache/mediainfo:/jellyfin-mediainfo-cache
+Путь настраивается через IPTV_JELLYFIN_MEDIAINFO_DIR (env) или
+config.json → jellyfin.mediainfo_cache_dir.
 
 Внешние M3U-плейлисты
 Раздел playlist_sources позволяет подключить публичные M3U-плейлисты
@@ -323,6 +385,10 @@ External M3U playlists — search channels across public playlists
 (GitHub and similar) from the streams modal. A found URL can be checked
 with one click and inserted into the channel stream.
 
+Channel events log — separate text log of changes (configuration
+
+UP/DOWN transitions). See "Channel events log" section.
+
 EPG prune + VACUUM — programmes older than 7 days are removed after
 each successful source import; the DB is compacted (VACUUM) once a
 day at IPTV_EPG_UPDATE_TIME. meta.updated_at survives restarts,
@@ -344,7 +410,7 @@ FlareSolverr — only if you plan to use resolvers that go through it
 Quick start
 All required files live in the project root.
 
-Create the working data/ directory and copy the examples:
+1. Create the working data/ directory and copy the examples:
 
 bash
 mkdir -p data
@@ -352,7 +418,7 @@ cp config.example.json   data/config.json
 cp override.example.json data/override.json      # optional
 cp .env.example          .env
 cp docker-compose.example.yml docker-compose.yml
-Put your Jellyfin API key into .env:
+2. Put your Jellyfin API key into .env:
 
 text
 IPTV_JELLYFIN_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
@@ -360,18 +426,18 @@ Create the key in Jellyfin: Dashboard → API Keys → Add.
 Without the key, EPG refreshes on Jellyfin's own schedule — the automatic
 guide-refresh trigger won't work.
 
-Edit data/config.json — your channels and EPG sources.
+3. Edit data/config.json — your channels and EPG sources.
 
-Build and start:
+4. Build and start:
 
 bash
 docker compose build iptv-proxy
 docker compose up -d
-Open the web UI:
+5. Open the web UI:
 
 text
 http://<host>:9098/manage
-Add to Jellyfin (Live TV):
+6. Add to Jellyfin (Live TV):
 
 What	URL
 TV sources (M3U)	http://iptv-proxy:8000/m3u
@@ -441,7 +507,8 @@ json
             "url": "https://site.example/watch",
             "resolver": "auto",
             "ua": "Mozilla/5.0 ...",
-            "mux_state": "auto"
+            "mux_state": "auto",
+            "stream_id": 3918603096042605
         }
     ],
     "fallback": true
@@ -453,6 +520,10 @@ auto | direct | yt-dlp | streamlink
 flaresolverr_simple | flaresolverr_session | sniffer
 auto iterates through the resolvers in resolver.order until one
 succeeds. A specific name forces only that resolver to be used.
+
+The stream_id field is an internal stream identifier (52-bit integer).
+Assigned automatically on add/save. Needed so streams_cache slots do
+not lose their binding when streams are reordered. Do not touch manually.
 
 Manual mux control (mux_state)
 mux_state lives on a stream (streams[i].mux_state). Values:
@@ -466,14 +537,66 @@ Priority: mux_state of the active stream > needs_mux from cache.
 Set from the UI: channel → modal → 🎬 Streams → mux: select next to
 Prefetch. Or directly in config.json.
 
-Note on on: works only for streams that Jellyfin-ffmpeg reads
-correctly from the mux TS output. For ordinary HLS channels (Euronews,
-Deutsche Welle, ivi/NTV), mux_state=on breaks playback — Jellyfin
-sets -f hls and gets raw TS. Use auto or off for those.
+Note on on: works for any stream where Jellyfin-ffmpeg successfully
+reads raw TS from the muxer. When mux_state (auto ↔ on ↔ off),
+active_stream_index, url, or resolver of the active stream changes,
+iptv-proxy automatically removes Jellyfin's mediainfo cache for that
+channel, so no Jellyfin restart is needed and the old-mode cache does not
+get stuck (see "Jellyfin mediainfo cache" below).
 
 Note on off: if the channel has #EXT-X-MEDIA:TYPE=AUDIO (split
 tracks), Jellyfin cannot mux them itself — it will be silent or fail.
 Use auto or on for those.
+
+Channel events log
+A separate text log with the change history: logs/channel_events.log.
+Line-based, readable via tail -f:
+
+text
+2026-10-02 18:15:23 [NTV] cfg: stream#1 (ivi.ru/...) mux_state: auto -> on (ui)
+2026-10-02 18:16:01 [SkyNews] state: UP -> DOWN (healthcheck)
+2026-10-02 18:17:44 [Euronews] state: DOWN -> UP (ui)
+Prefix cfg: — configuration changes (via UI or EPG auto-match).
+Prefix state: — channel health transitions (UP/DOWN, automatic
+active-stream switches). In parentheses at the end — source: ui,
+healthcheck, fallback, startup, auto_match.
+
+Rotation uses the same settings as the main logs
+(IPTV_LOG_MAX_BYTES, IPTV_LOG_BACKUP_COUNT).
+
+File path: IPTV_CHANNEL_EVENTS_LOG (env) or
+config.json → logging.channel_events_log. Default —
+/app/logs/channel_events.log.
+
+Jellyfin mediainfo cache
+On the first probe of a channel, Jellyfin stores the container info
+(Container: hls or Container: ts) into cache/mediainfo/*.json.
+On subsequent opens it does not re-probe — it reuses the cached format.
+
+If the channel switches delivery mode (HLS ↔ raw TS via mux), the old
+cache breaks playback (Jellyfin-ffmpeg exits with code 183
+"Invalid data found when processing input").
+
+Solution: iptv-proxy automatically removes Jellyfin's mediainfo
+cache for a channel when any of the following changes:
+
+mux_state of the active stream (auto ↔ on ↔ off),
+
+active_stream_index,
+
+url of the active stream,
+
+resolver of the active stream.
+
+On the next open, Jellyfin does a fresh probe and detects the format
+correctly. No Jellyfin restart needed.
+
+Requires a volume mount in docker-compose.yaml:
+
+yaml
+- /opt/docker-compose/configs/jellyfin/cache/mediainfo:/jellyfin-mediainfo-cache
+The path is configurable via IPTV_JELLYFIN_MEDIAINFO_DIR (env) or
+config.json → jellyfin.mediainfo_cache_dir.
 
 External M3U playlists
 The playlist_sources section lets you attach public M3U playlists

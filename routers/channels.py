@@ -1,19 +1,31 @@
+"""
+routers/channels.py — CRUD каналов и их потоков.
+
+Рефакторинг channels-refactor-v1:
+  - проверки потоков вынесены в routers/channels_checks.py
+  - массовая работа с резолверами вынесена в routers/channels_resolvers.py
+Здесь остаётся всё, что меняет config.json:
+  /channels/add
+  /channels/update-stream
+  /channels/delete
+  /channels/clear-cache
+  /channels/toggle
+  /channels/toggle-fallback
+  /channels/get
+  + внутренние хелперы _apply_pre_resolved_cache и _splice_streams_cache.
+"""
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-import asyncio
 import re
 import time
 
 import core.state as state
 from core.config import IPTV_DEFAULT_UA, logger
-from services.resolver import is_valid_resolver, probe_stream
-from services.limits import resolve_with_semaphores, probe_sem
-from services.healthcheck import trigger_check_all
-from services.events import send_broadcast_async
+from services.resolver import is_valid_resolver
 from services.epg_service import epg_manager
+from services.channel_events import log_cfg, log_state
 
 router = APIRouter()
-
 
 def _apply_pre_resolved_cache(name: str, streams: list):
     """Применяет cached_stream/cache_expire/probe_elapsed, пришедшие из UI.
@@ -90,30 +102,38 @@ def _apply_pre_resolved_cache(name: str, streams: list):
 # срабатывают рекурсивно, без самоблокировки.
 
 
-@router.post("/channels/check-all/start")
-def start_healthcheck():
-    channels = state.load_channels()
-    if not channels:
-        return JSONResponse({"success": False, "error": "Нет каналов для проверки"})
+def _splice_streams_cache(entry: dict, old_streams: list, new_streams: list):
+    """Пересобирает streams_cache под новый набор стримов.
 
-    # trigger_check_all сам создаёт task, шлёт SSE, кладёт каналы в очередь.
-    task_id = trigger_check_all(channels)
-    return JSONResponse({"success": True, "task_id": task_id})
+    Матчинг по stream_id — единственному стабильному identity стрима.
+    Слот следует за стримом при переупорядочивании, удалении соседей,
+    смене URL, смене resolver и при двух одинаковых URL с разными
+    resolver'ами. Удалённый стрим уносит слот с собой, добавленный
+    приходит с пустым.
+    """
+    old_cache = entry.get("streams_cache", [])
+    if not isinstance(old_cache, list):
+        old_cache = []
 
+    old_by_id = {}
+    for i, old_s in enumerate(old_streams):
+        if not isinstance(old_s, dict):
+            continue
+        sid = old_s.get("stream_id")
+        if isinstance(sid, int) and sid > 0 and sid not in old_by_id:
+            old_by_id[sid] = i
 
-@router.get("/channels/check-all/status/{task_id}")
-def get_healthcheck_status(task_id: str):
-    with state._healthcheck_lock:
-        task = state._healthcheck_tasks.get(task_id)
-        if not task:
-            return JSONResponse({"success": False, "error": "Задача не найдена"})
-        return JSONResponse({
-            "success": True,
-            "progress": task["progress"],
-            "total": task["total"],
-            "results": task["results"],
-            "done": task["done"]
-        })
+    new_cache = []
+    for new_s in new_streams:
+        slot = {}
+        if isinstance(new_s, dict):
+            sid = new_s.get("stream_id")
+            if isinstance(sid, int) and sid > 0:
+                i = old_by_id.get(sid)
+                if i is not None and i < len(old_cache) and isinstance(old_cache[i], dict):
+                    slot = old_cache[i]
+        new_cache.append(slot)
+    entry["streams_cache"] = new_cache
 
 
 @router.get("/channels/get")
@@ -158,363 +178,6 @@ def get_channel_info(name: str):
             data["streams_cache"].append({})
     return JSONResponse({"success": True, "data": data})
 
-
-@router.post("/channels/check-single")
-async def check_single_stream(request: Request):
-    try:
-        data = await request.json()
-        name = data.get("name", "")
-        url = data.get("url")
-        ua = data.get("ua", IPTV_DEFAULT_UA)
-        fs_regex = data.get("fs_regex", "")
-        resolver = data.get("resolver", "auto")
-        if not url:
-            return JSONResponse({"success": False, "detail": "URL не указан"})
-        if not is_valid_resolver(resolver):
-            resolver = "auto"
-
-        logger.info(f"[HEALTHCHECK] checking: {url}")
-        ch = {"name": name or "temp", "url": url, "ua": ua, "fs_regex": fs_regex, "resolver": resolver}
-        try:
-            is_direct, payload, expire_time, method = resolve_with_semaphores(ch)
-            probe_elapsed = None
-
-            if name:
-                channels = state.load_channels()
-                ch_found = next((c for c in channels if c["name"] == name), None)
-                if ch_found:
-                    # Ищем слот по url+resolver — именно в него пишем результат проверки,
-                    # а не обязательно в активный: пользователь мог проверить другой стрим.
-                    target_stream_index = None
-                    for s_idx, s in enumerate(ch_found.get("streams", [])):
-                        if s.get("url") == url and s.get("resolver", "auto") == resolver:
-                            target_stream_index = s_idx
-                            break
-                    if target_stream_index is None:
-                        for s_idx, s in enumerate(ch_found.get("streams", [])):
-                            if s.get("url") == url:
-                                target_stream_index = s_idx
-                                break
-
-                    if target_stream_index is not None:
-                        state.set_stream_cache(name, target_stream_index, payload, is_direct,
-                                               expire_time, method, probe_elapsed)
-                        # Санитарные отметки на слоте
-                        with state.cache_lock:
-                            entry = state._epg_cache.setdefault(
-                                name, {"streams_cache": []}
-                            )
-                            streams = entry.setdefault("streams_cache", [])
-                            while len(streams) <= target_stream_index:
-                                streams.append({})
-                            if not isinstance(streams[target_stream_index], dict):
-                                streams[target_stream_index] = {}
-                            streams[target_stream_index]["last_checked_url"] = url
-                            streams[target_stream_index]["last_checked_resolver"] = resolver
-                        state.save_cache()
-
-                        if resolver == "auto" and method != "auto":
-                            with state.channels_lock:
-                                channels = state.load_channels()
-                                for ch_ in channels:
-                                    if ch_["name"] == name:
-                                        streams = ch_.get("streams", [])
-                                        if target_stream_index < len(streams):
-                                            streams[target_stream_index]["resolver"] = method
-                                            if ch_.get("active_stream_index") == target_stream_index:
-                                                ch_["resolver"] = method
-                                            state.save_channels_to_file(channels)
-                                            logger.info(f"[CHECK] '{name}': stream {target_stream_index} resolver set to '{method}'")
-                                        break
-
-                        # SSE про статус активного слота — обновляем только если
-                        # проверяли активный (иначе UI покажет не то).
-                        if ch_found.get("active_stream_index") == target_stream_index:
-                            send_broadcast_async(name, {
-                                "last_check_time": time.time(),
-                                "last_check_success": True,
-                                "last_check_detail": f"Resolved via {method}"
-                            })
-                    else:
-                        logger.warning(f"[HEALTHCHECK] '{name}': URL did not match any stream")
-                else:
-                    logger.warning(f"[HEALTHCHECK] '{name}': channel not found in config")
-            return JSONResponse({
-                "success": True,
-                "detail": f"Resolved via {method}",
-                "method": method,
-                "cached_stream": payload,
-                "cache_expire": expire_time,
-                "probe": None
-            })
-        except Exception as e:
-            if name:
-                # Провал проверки — пишем в слот того стрима, который проверяли
-                # (если смогли его найти). Если не нашли — в активный.
-                channels = state.load_channels()
-                ch_found = next((c for c in channels if c["name"] == name), None)
-                target_stream_index = None
-                if ch_found:
-                    for s_idx, s in enumerate(ch_found.get("streams", [])):
-                        if s.get("url") == url and s.get("resolver", "auto") == resolver:
-                            target_stream_index = s_idx
-                            break
-                    if target_stream_index is None:
-                        for s_idx, s in enumerate(ch_found.get("streams", [])):
-                            if s.get("url") == url:
-                                target_stream_index = s_idx
-                                break
-                    if target_stream_index is None:
-                        target_stream_index = ch_found.get("active_stream_index", 0)
-                else:
-                    target_stream_index = 0
-
-                with state.cache_lock:
-                    entry = state._epg_cache.setdefault(
-                        name, {"streams_cache": []}
-                    )
-                    streams = entry.setdefault("streams_cache", [])
-                    while len(streams) <= target_stream_index:
-                        streams.append({})
-                    if not isinstance(streams[target_stream_index], dict):
-                        streams[target_stream_index] = {}
-                    streams[target_stream_index]["last_check_time"] = time.time()
-                    streams[target_stream_index]["last_check_success"] = False
-                    streams[target_stream_index]["last_check_detail"] = str(e)
-                state.save_cache()
-
-                if ch_found and ch_found.get("active_stream_index") == target_stream_index:
-                    send_broadcast_async(name, {
-                        "last_check_time": time.time(),
-                        "last_check_success": False,
-                        "last_check_detail": str(e)
-                    })
-            return JSONResponse({"success": False, "detail": str(e)})
-    except Exception as e:
-        logger.error(f"[HEALTHCHECK] check error: {e}")
-        return JSONResponse({"success": False, "detail": str(e)})
-
-
-@router.post("/channels/probe")
-async def probe_channel_stream(request: Request):
-    try:
-        data = await request.json()
-        name = data.get("name")
-        url = data.get("url")
-
-        if not url and not name:
-            return JSONResponse({"success": False, "error": "Нужен URL или имя канала"})
-
-        # Приоритет — URL. Сценарий: пользователь создаёт новый канал,
-        # резолвит поток («Проверить поток» работает), но ffprobe падал
-        # с «канал не найден» — потому что старый код при наличии name
-        # шёл в get_channel_stream(name), а канала ещё нет в конфиге.
-        # Симметрично: при проверке неактивного стрима существующего
-        # канала (url передан) раньше тестировался активный стрим.
-        if url:
-            ch = {
-                "name": name or "temp",
-                "url": url,
-                "ua": data.get("ua", IPTV_DEFAULT_UA),
-                "fs_regex": data.get("fs_regex", ""),
-                "resolver": data.get("resolver", "auto"),
-            }
-
-            def _resolve_and_probe_url():
-                is_direct, payload, expire_time, method = resolve_with_semaphores(ch)
-                with probe_sem:
-                    probe_result = probe_stream(payload, channel=name)
-                return is_direct, payload, expire_time, method, probe_result
-
-            is_direct, payload, expire_time, method, probe_result = await asyncio.to_thread(_resolve_and_probe_url)
-            probe_elapsed = probe_result.get("probe_elapsed") if probe_result.get("ok") else None
-
-            # Если name указывает на существующий канал, а url совпадает
-            # с одним из его стримов — пишем payload и probe_elapsed именно
-            # в слот этого стрима, а не активного. Иначе «Проверить ffprobe»
-            # на неактивном стриме затирал бы метрики активного.
-            if name:
-                ch_found = state.get_channel(name)
-                if ch_found:
-                    target_idx = None
-                    for idx, s in enumerate(ch_found.get("streams", [])):
-                        if s.get("url") == url:
-                            target_idx = idx
-                            break
-                    if target_idx is not None:
-                        state.set_stream_cache(name, target_idx, payload, is_direct,
-                                               expire_time, method, probe_elapsed)
-                        active_idx = ch_found.get("active_stream_index", 0)
-                        with state.cache_lock:
-                            entry = state._epg_cache.setdefault(name, {"streams_cache": []})
-                            streams = entry.setdefault("streams_cache", [])
-                            while len(streams) <= target_idx:
-                                streams.append({})
-                            if not isinstance(streams[target_idx], dict):
-                                streams[target_idx] = {}
-                            s = streams[target_idx]
-                            s["last_checked_url"] = url
-                            s["last_checked_resolver"] = data.get("resolver", "auto")
-                            # set_stream_cache выше уже поставил last_check_success=True
-                            # (его контракт — «резолв успешен»). Если probe провалился,
-                            # переопределяем именно в target-слот, а не в активный.
-                            if probe_result.get("ok"):
-                                s["last_check_success"] = True
-                                s["last_check_detail"] = f"Resolved via {method}"
-                            else:
-                                s["last_check_success"] = False
-                                s["last_check_detail"] = f"Probe failed: {probe_result.get('detail', 'no detail')}"
-                        state.save_cache()
-
-                        # Статус канала в UI = активный стрим. Если проверяли
-                        # неактивный — badge менять не надо. Симметрично
-                        # check_single_stream (там ровно та же проверка).
-                        if active_idx == target_idx:
-                            if probe_result.get("ok"):
-                                send_broadcast_async(name, {
-                                    "last_check_time": time.time(),
-                                    "last_check_success": True,
-                                    "last_check_detail": f"Resolved via {method}"
-                                })
-                            else:
-                                send_broadcast_async(name, {
-                                    "last_check_time": time.time(),
-                                    "last_check_success": False,
-                                    "last_check_detail": f"Probe failed: {probe_result.get('detail', 'no detail')}"
-                                })
-
-            return JSONResponse({
-                "success": True,
-                "method": method,
-                "probe": probe_result
-            })
-
-        # Ветка без url — резолвим активный стрим канала через кэш.
-        # Используется «Проверить ffprobe» в модалке канала, когда канал
-        # уже сохранён и проверяем его текущий активный поток.
-        def _get_stream():
-            return state.get_channel_stream(name)
-        is_direct, payload, expire_time, method = await asyncio.to_thread(_get_stream)
-        if method == "cache":
-            _ch = next((c for c in state.load_channels() if c["name"] == name), None)
-            if _ch:
-                _idx = _ch.get("active_stream_index", 0)
-                _streams = _ch.get("streams", [])
-                if 0 <= _idx < len(_streams):
-                    method = _streams[_idx].get("resolver", "auto")
-
-        def _probe():
-            return probe_stream(payload, channel=name)
-        probe_result = await asyncio.to_thread(_probe)
-
-        if probe_result.get("ok") and "probe_elapsed" in probe_result:
-            ch = next((c for c in state.load_channels() if c["name"] == name), None)
-            if ch:
-                active_idx = ch.get("active_stream_index", 0)
-                state.update_probe_elapsed_in_cache(name, active_idx, probe_result["probe_elapsed"])
-
-        if probe_result.get("ok"):
-            state.mark_channel_healthy(name, method=method)
-            send_broadcast_async(name, {
-                "last_check_time": time.time(),
-                "last_check_success": True,
-                "last_check_detail": f"Resolved via {method}"
-            })
-        else:
-            detail = f"Probe failed: {probe_result.get('detail', 'no detail')}"
-            state.mark_channel_unhealthy(name, detail=detail)
-            state.save_cache()
-            send_broadcast_async(name, {
-                "last_check_time": time.time(),
-                "last_check_success": False,
-                "last_check_detail": detail
-            })
-
-        return JSONResponse({
-            "success": True,
-            "method": method,
-            "probe": probe_result
-        })
-    except Exception as e:
-        logger.error(f"[PROBE] error: {e}")
-        return JSONResponse({"success": False, "error": str(e)})
-
-
-@router.post("/channels/check-mux")
-async def check_stream_mux(request: Request):
-    """Проверяет, требуется ли мукс для конкретного потока.
-
-    Резолвит URL → берёт master-плейлист → ищет #EXT-X-MEDIA:TYPE=AUDIO.
-    Ничего не проигрывает, Jellyfin не трогает."""
-    try:
-        data = await request.json()
-        name = data.get("name")
-        url = data.get("url")
-        ua = data.get("ua", IPTV_DEFAULT_UA)
-        fs_regex = data.get("fs_regex", "")
-        resolver = data.get("resolver", "auto")
-        if not url:
-            return JSONResponse({"success": False, "error": "URL не указан"})
-
-        ch = {"name": name or "temp", "url": url, "ua": ua,
-              "fs_regex": fs_regex, "resolver": resolver}
-
-        def _work():
-            is_direct, payload, expire_time, method = resolve_with_semaphores(ch)
-            from services.proxy_service import needs_mux as _nm
-            needs_mux_flag = _nm(payload, channel_name=name)
-            return is_direct, payload, expire_time, method, needs_mux_flag
-
-        is_direct, payload, expire_time, method, needs_mux_flag = await asyncio.to_thread(_work)
-
-        # Кэшируем в слот, чтобы при следующем открытии модалки
-        # бейдж был сразу, без повторного HTTP-запроса.
-        if name:
-            ch_found = state.get_channel(name)
-            if ch_found:
-                # check-mux-slot-v1: ищем slot сначала по url из streams,
-                # потом по last_checked_url в кэше (на случай, если sniffer
-                # перерезолвил payload и cached_stream отличается от url,
-                # который прислал UI).
-                target_idx = None
-                for idx, s in enumerate(ch_found.get("streams", [])):
-                    if s.get("url") == url:
-                        target_idx = idx
-                        break
-                if target_idx is None:
-                    with state.cache_lock:
-                        _entry = state._epg_cache.get(name, {})
-                        _slots = _entry.get("streams_cache", []) if isinstance(_entry, dict) else []
-                        for idx, slot in enumerate(_slots):
-                            if not isinstance(slot, dict):
-                                continue
-                            if slot.get("last_checked_url") == url:
-                                target_idx = idx
-                                break
-                # Если всё равно не нашли — пишем в активный (лучше, чем ничего).
-                if target_idx is None:
-                    target_idx = ch_found.get("active_stream_index", 0)
-                    logger.info(f"[CHECK-MUX] '{name}': URL не совпал ни с одним stream, пишу в активный slot {target_idx}")
-                if target_idx is not None:
-                    state.set_stream_cache(name, target_idx, payload, is_direct,
-                                           expire_time, method)
-                    with state.cache_lock:
-                        entry = state._epg_cache.setdefault(name, {"streams_cache": []})
-                        streams = entry.setdefault("streams_cache", [])
-                        while len(streams) <= target_idx:
-                            streams.append({})
-                        if not isinstance(streams[target_idx], dict):
-                            streams[target_idx] = {}
-                        streams[target_idx]["needs_mux"] = needs_mux_flag
-                        streams[target_idx]["last_checked_url"] = url
-                    state.save_cache()
-
-        return JSONResponse({"success": True, "needs_mux": needs_mux_flag, "method": method})
-    except Exception as e:
-        logger.error(f"[CHECK-MUX] error: {e}")
-        return JSONResponse({"success": False, "error": str(e)})
-
-
 @router.post("/channels/toggle")
 async def toggle_channel(request: Request):
     try:
@@ -539,12 +202,15 @@ async def toggle_channel(request: Request):
             state.save_channels_to_file(sorted_channels)
 
         logger.info(f"[TOGGLE] '{name}': {'enabled' if enabled else 'disabled'}")
+        try:
+            log_state(name, "enabled" if enabled else "disabled", "ui")
+        except Exception:
+            pass
         return JSONResponse({"success": True})
 
     except Exception as e:
         logger.error(f"[TOGGLE] error: {e}")
         return JSONResponse({"success": False, "error": str(e)})
-
 
 @router.post("/channels/toggle-fallback")
 async def toggle_fallback(request: Request):
@@ -570,11 +236,14 @@ async def toggle_fallback(request: Request):
             sorted_channels = state.sort_channels_by_chno(channels)
             state.save_channels_to_file(sorted_channels)
         logger.info(f"[FALLBACK] '{name}': fallback {'enabled' if enabled else 'disabled'}")
+        try:
+            log_cfg(name, f"fallback: {not enabled} -> {enabled}", "ui")
+        except Exception:
+            pass
         return JSONResponse({"success": True})
     except Exception as e:
         logger.error(f"[FALLBACK] toggle error: {e}")
         return JSONResponse({"success": False, "error": str(e)})
-
 
 @router.post("/channels/delete")
 async def delete_channel(request: Request):
@@ -597,11 +266,14 @@ async def delete_channel(request: Request):
 
         state.save_cache()
         logger.info(f"[CHANNELS] '{name_to_delete}': deleted")
+        try:
+            log_cfg(name_to_delete, "deleted", "ui")
+        except Exception:
+            pass
         return JSONResponse({"success": True})
     except Exception as e:
         logger.error(f"[CHANNELS] delete error: {e}")
         return JSONResponse({"success": False, "error": str(e)})
-
 
 @router.post("/channels/clear-cache")
 async def clear_channel_cache(request: Request):
@@ -622,40 +294,6 @@ async def clear_channel_cache(request: Request):
     except Exception as e:
         logger.error(f"[CACHE] clear error: {e}")
         return JSONResponse({"success": False, "error": str(e)})
-
-
-def _splice_streams_cache(entry: dict, old_streams: list, new_streams: list):
-    """Пересобирает streams_cache под новый набор стримов.
-
-    Матчинг по stream_id — единственному стабильному identity стрима.
-    Слот следует за стримом при переупорядочивании, удалении соседей,
-    смене URL, смене resolver и при двух одинаковых URL с разными
-    resolver'ами. Удалённый стрим уносит слот с собой, добавленный
-    приходит с пустым.
-    """
-    old_cache = entry.get("streams_cache", [])
-    if not isinstance(old_cache, list):
-        old_cache = []
-
-    old_by_id = {}
-    for i, old_s in enumerate(old_streams):
-        if not isinstance(old_s, dict):
-            continue
-        sid = old_s.get("stream_id")
-        if isinstance(sid, int) and sid > 0 and sid not in old_by_id:
-            old_by_id[sid] = i
-
-    new_cache = []
-    for new_s in new_streams:
-        slot = {}
-        if isinstance(new_s, dict):
-            sid = new_s.get("stream_id")
-            if isinstance(sid, int) and sid > 0:
-                i = old_by_id.get(sid)
-                if i is not None and i < len(old_cache) and isinstance(old_cache[i], dict):
-                    slot = old_cache[i]
-        new_cache.append(slot)
-    entry["streams_cache"] = new_cache
 
 
 @router.post("/channels/update-stream")
@@ -700,6 +338,29 @@ async def update_stream_settings(request: Request):
         # Для существующих стримов сохраняем, для новых (созданных в UI) —
         # назначаем свежий id, чтобы слот в streams_cache не потерял привязку.
         state.assign_stream_ids(streams)
+
+        # mediainfo-invalidate-update-stream-v1: снимок старого состояния
+        # активного потока ДО сохранения. После сохранения сравним — если
+        # сменился active_stream_index / mux_state / url / resolver активного
+        # потока, инвалидируем mediainfo-кэш Jellyfin для этого канала.
+        _old_active_idx = None
+        _old_mux_state = None
+        _old_url = None
+        _old_resolver = None
+        _old_streams_snapshot = []
+        try:
+            _ch_old = state.get_channel(orig_name)
+            if _ch_old:
+                _old_active_idx = _ch_old.get("active_stream_index", 0)
+                _old_streams_snapshot = list(_ch_old.get("streams", []))
+                if isinstance(_old_active_idx, int) and 0 <= _old_active_idx < len(_old_streams_snapshot):
+                    _old_s = _old_streams_snapshot[_old_active_idx]
+                    if isinstance(_old_s, dict):
+                        _old_mux_state = _old_s.get("mux_state", "auto")
+                        _old_url = _old_s.get("url", "")
+                        _old_resolver = _old_s.get("resolver", "auto")
+        except Exception as _e:
+            logger.warning(f"[MEDIAINFO] '{orig_name}': failed to snapshot old state: {_e}")
 
         with state.channels_lock:
             channels = state.load_channels()
@@ -797,6 +458,90 @@ async def update_stream_settings(request: Request):
         _apply_pre_resolved_cache(new_name, streams)
 
         state.save_cache()
+
+        # channel-events-channels-v1: пишем cfg-события по каждому изменению.
+        try:
+            if orig_name != new_name:
+                log_cfg(new_name, f"renamed: {orig_name} -> {new_name}", "ui")
+            if _old_active_idx is not None and _old_active_idx != active_index:
+                log_cfg(new_name, f"active_stream: {_old_active_idx} -> {active_index}", "ui")
+
+            _old_by_id = {}
+            for _os in _old_streams_snapshot:
+                if isinstance(_os, dict):
+                    _sid = _os.get("stream_id")
+                    if isinstance(_sid, int) and _sid > 0:
+                        _old_by_id[_sid] = _os
+            _new_ids = set()
+            for _i, _ns in enumerate(streams):
+                if not isinstance(_ns, dict):
+                    continue
+                _sid = _ns.get("stream_id")
+                if not isinstance(_sid, int) or _sid <= 0:
+                    continue
+                _new_ids.add(_sid)
+                _os = _old_by_id.get(_sid)
+                _url = _ns.get("url", "")
+                if _os is None:
+                    log_cfg(new_name, "added", "ui", stream_num=_i, stream_url=_url)
+                    continue
+                for _f in ("url", "resolver", "ua", "fs_regex", "mux_state"):
+                    _o = _os.get(_f, "")
+                    _n = _ns.get(_f, "")
+                    if _f == "mux_state":
+                        _o = _o or "auto"; _n = _n or "auto"
+                    if _f == "resolver":
+                        _o = _o or "auto"; _n = _n or "auto"
+                    if _o != _n:
+                        log_cfg(new_name, f"{_f}: {_o} -> {_n}", "ui",
+                                stream_num=_i, stream_url=_url)
+                # disable отдельно: событие disabled/enabled, не disable: False -> True.
+                _o_dis = bool(_os.get("disable", False))
+                _n_dis = bool(_ns.get("disable", False))
+                if _o_dis != _n_dis:
+                    log_cfg(new_name, "disabled" if _n_dis else "enabled", "ui",
+                            stream_num=_i, stream_url=_url)
+                _o_pf = bool(_os.get("prefetch", False))
+                _n_pf = bool(_ns.get("prefetch", False))
+                if _o_pf != _n_pf:
+                    log_cfg(new_name, f"prefetch: {_o_pf} -> {_n_pf}", "ui",
+                            stream_num=_i, stream_url=_url)
+            for _sid, _os in _old_by_id.items():
+                if _sid not in _new_ids:
+                    log_cfg(new_name, "removed", "ui",
+                            stream_url=_os.get("url", ""))
+        except Exception as _e:
+            logger.warning(f"[EVENTS] '{new_name}': cfg events failed: {_e}")
+
+        # mediainfo-invalidate-update-stream-v1
+        try:
+            _new_mux_state = "auto"
+            _new_url = ""
+            _new_resolver = "auto"
+            if isinstance(active_index, int) and 0 <= active_index < len(streams):
+                _new_s = streams[active_index]
+                if isinstance(_new_s, dict):
+                    _new_mux_state = _new_s.get("mux_state", "auto")
+                    _new_url = _new_s.get("url", "")
+                    _new_resolver = _new_s.get("resolver", "auto")
+
+            _changes = []
+            if _old_active_idx is not None and _old_active_idx != active_index:
+                _changes.append(f"active_index {_old_active_idx}->{active_index}")
+            if _old_mux_state is not None and _old_mux_state != _new_mux_state:
+                _changes.append(f"mux_state {_old_mux_state}->{_new_mux_state}")
+            if _old_url is not None and _old_url != _new_url:
+                _changes.append("url changed")
+            if _old_resolver is not None and _old_resolver != _new_resolver:
+                _changes.append(f"resolver {_old_resolver}->{_new_resolver}")
+
+            if _changes:
+                state.invalidate_jellyfin_mediainfo(
+                    new_name, reason="; ".join(_changes)
+                )
+        except Exception as _e:
+            logger.warning(f"[MEDIAINFO] '{new_name}': invalidate from update-stream failed: {_e}")
+
         return JSONResponse({"success": True})
     except Exception as e:
         logger.error(f"[CHANNELS] update error: {e}")
@@ -879,85 +624,13 @@ async def add_new_channel(request: Request):
         _apply_pre_resolved_cache(name, streams)
 
         logger.info(f"[CHANNELS] '{name}': added (chno={chno}, streams={len(streams)})")
+        try:
+            log_cfg(name, "added", "ui")
+        except Exception:
+            pass
         return JSONResponse({"success": True})
     except Exception as e:
         logger.error(f"[CHANNELS] add error: {e}")
         return JSONResponse({"success": False, "error": str(e)})
 
-@router.post("/channels/apply-resolvers")
-async def apply_resolvers(request: Request):
-    try:
-        last_task = None
-        with state._healthcheck_lock:
-            for task_id, task in state._healthcheck_tasks.items():
-                if task.get("done"):
-                    if last_task is None or task.get("finished_at", 0) > last_task.get("finished_at", 0):
-                        last_task = task
-
-        if not last_task:
-            return JSONResponse({"success": False, "error": "Нет завершённой проверки"})
-
-        results = last_task.get("results", {})
-        updates = {}
-        for name, res in results.items():
-            if res.get("success") and res.get("method"):
-                updates[name] = res["method"]
-
-        if not updates:
-            return JSONResponse({"success": False, "error": "Нет успешных методов для применения"})
-
-        with state.channels_lock:
-            channels = state.load_channels()
-            updated_count = 0
-            for ch in channels:
-                if ch["name"] in updates and ch.get("resolver", "auto") != updates[ch["name"]]:
-                    ch["resolver"] = updates[ch["name"]]
-                    active_idx = ch.get("active_stream_index", 0)
-                    if ch.get("streams") and active_idx < len(ch["streams"]):
-                        ch["streams"][active_idx]["resolver"] = updates[ch["name"]]
-                    updated_count += 1
-                    # Смена resolver'а касается только активного стрима —
-                    # не трогаем кэши остальных.
-                    state.clear_stream_cache(ch["name"], active_idx)
-
-            if updated_count > 0:
-                sorted_channels = state.sort_channels_by_chno(channels)
-                state.save_channels_to_file(sorted_channels)
-                logger.info(f"[APPLY-RESOLVERS] resolvers updated for {updated_count} channels")
-
-        return JSONResponse({
-            "success": True,
-            "updated": updated_count,
-            "message": f"Обновлено резолверов: {updated_count}"
-        })
-    except Exception as e:
-        logger.error(f"[APPLY-RESOLVERS] error: {e}")
-        return JSONResponse({"success": False, "error": str(e)})
-
-
-@router.post("/channels/reset-resolvers")
-async def reset_resolvers(request: Request):
-    try:
-        with state.channels_lock:
-            channels = state.load_channels()
-            updated_count = 0
-            for ch in channels:
-                if ch.get("resolver", "auto") != "auto":
-                    ch["resolver"] = "auto"
-                    active_idx = ch.get("active_stream_index", 0)
-                    if ch.get("streams") and active_idx < len(ch["streams"]):
-                        ch["streams"][active_idx]["resolver"] = "auto"
-                    updated_count += 1
-                    state.clear_stream_cache(ch["name"], active_idx)
-            if updated_count > 0:
-                sorted_channels = state.sort_channels_by_chno(channels)
-                state.save_channels_to_file(sorted_channels)
-                logger.info(f"[RESET-RESOLVERS] resolvers reset for {updated_count} channels")
-        return JSONResponse({
-            "success": True,
-            "updated": updated_count,
-            "message": f"Сброшено резолверов: {updated_count}"
-        })
-    except Exception as e:
-        logger.error(f"[RESET-RESOLVERS] error: {e}")
-        return JSONResponse({"success": False, "error": str(e)})
+# channels-refactor-v1

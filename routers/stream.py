@@ -1,29 +1,31 @@
+"""
+routers/stream.py — redirect, m3u, synthetic, black.ts.
+
+После stream-refactor-v1 здесь остаётся то, что видит Jellyfin
+как точку входа канала. HLS-прокси вынесен в stream_hls.py,
+мукс — в stream_mux.py.
+"""
 from fastapi import APIRouter, Request, Response
-from fastapi.responses import RedirectResponse, StreamingResponse
-import urllib
-import urllib.error
+from fastapi.responses import RedirectResponse
+import asyncio
 import os
 import re
-import time
-import asyncio
 import threading
-from urllib.parse import quote, unquote, urljoin
+import time
+from urllib.parse import quote
 
 import core.state as state
-from core.config import IPTV_DEFAULT_UA, IPTV_FETCH_TIMEOUT, IPTV_FAILED_RESOLVE_TTL, logger
+from core.config import IPTV_FAILED_RESOLVE_TTL, logger
 from services.resolver import parse_url_headers
 from services.proxy_service import (
-    _proxy_googlevideo_manifest, _build_redirect_response, fix_hls_manifest,
-    needs_mux, read_response_text, sanitize_channel,
+    _proxy_googlevideo_manifest, _build_redirect_response,
+    needs_mux, BLACK_MANIFEST,
 )
-from services.mux_service import get_or_create_mux
 from services.fallback import try_switch_to_healthy_stream
 from services.healthcheck import revalidate_channel_in_background
 from services.events import save_cache_and_broadcast
-from services.segment_prefetch import schedule_prefetch, get_cached_segment
 
 router = APIRouter()
-
 
 def _decode_body_gzip_aware(raw: bytes) -> str:
     """Декодирует тело HTTP-ответа. Если body начинается с gzip magic-bytes
@@ -42,18 +44,6 @@ def _decode_body_gzip_aware(raw: bytes) -> str:
 # «Чёрный» манифест: 5-секундный VOD с одним сегментом.
 # Jellyfin его проигрывает и корректно останавливает сессию,
 # вместо бесконечных переподключений.
-BLACK_MANIFEST = (
-    "#EXTM3U\n"
-    "#EXT-X-VERSION:3\n"
-    "#EXT-X-PLAYLIST-TYPE:VOD\n"
-    "#EXT-X-TARGETDURATION:6\n"
-    "#EXT-X-MEDIA-SEQUENCE:0\n"
-    "#EXTINF:5.0,\n"
-    "/black.ts\n"
-    "#EXT-X-ENDLIST\n"
-)
-
-
 def _get_active_index(name: str) -> int:
     """Индекс активного слота канала. Тонкая обёртка над state.get_active_index."""
     return state.get_active_index(name)
@@ -157,6 +147,7 @@ def _build_stream_response(name: str, request: Request, is_direct: bool, payload
 
 
 @router.get("/redirect/{name}.m3u8")
+
 @router.get("/redirect/{name}.ts")
 async def redirect_channel_with_ext(name: str, request: Request):
     return await redirect_channel(name, request)
@@ -187,7 +178,6 @@ def _handle_stream_failure(name: str, active_idx: int, error: str, now: float):
     })
     logger.info(f"[BLACK-TS] '{name}': serving black manifest")
     return Response(content=BLACK_MANIFEST, media_type="application/vnd.apple.mpegurl")
-
 
 @router.get("/redirect/{name}")
 async def redirect_channel(name: str, request: Request):
@@ -264,7 +254,6 @@ async def redirect_channel(name: str, request: Request):
 
     return _build_stream_response(name, request, is_direct, payload, expire_time, method, active_idx=active_idx)
 
-
 @router.get("/m3u")
 def get_m3u(request: Request):
     base_url = str(request.base_url).rstrip('/')
@@ -333,538 +322,6 @@ def _override_master_bandwidth(manifest_text: str, bandwidth: int = 3250000) -> 
         out.append(line)
     return "\n".join(out)
 
-
-@router.get("/hls/manifest.m3u8")
-def proxy_hls_manifest(url: str, request: Request, referer: str = None, cookie: str = None, ua: str = None, channel: str = None):
-    channel = sanitize_channel(channel, url)
-    if channel:
-        state.mark_channel_active(channel)
-    try:
-        # FastAPI уже декодировал query-параметр. Повторный unquote()
-        # ломает percent-encoding внутри URL: %3A → :, %2B → +.
-        # CDN ожидает исходные %3A/%2B в startdate= — с `+` он читает
-        # как пробел и отдаёт 404.
-        target_url = url
-        # unquote-fix-v1: значения уже декодированы FastAPI.
-        headers = {"User-Agent": ua if ua else IPTV_DEFAULT_UA}
-        if referer:
-            headers["Referer"] = referer
-        if cookie:
-            headers["Cookie"] = cookie
-
-        req = urllib.request.Request(target_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=IPTV_FETCH_TIMEOUT) as resp:
-            final_url = resp.geturl()
-            content_type = resp.headers.get("Content-Type", "") or ""
-            raw = resp.read()
-
-        # Fast path: апстрим вернул бинарный TS-сегмент вместо манифеста.
-        # Jellyfin иногда просит .ts через manifest-эндпоинт (своя логика
-        # или устаревший кэш плеера). Отдаём байты как есть — декодировать
-        # нельзя, errors='ignore' уничтожит не-ASCII содержимое видеопотока.
-        if raw[:1] == b"G" and "html" not in content_type.lower():
-            logger.info(
-                f"[HLS-PROXY] [{channel or '?'}] non-HLS served as TS "
-                f"(len={len(raw)}) target_url={target_url}"
-            )
-            return Response(content=raw, media_type="video/mp2t")
-
-        content = _decode_body_gzip_aware(raw)
-
-        if not content.strip().startswith("#EXTM3U"):
-            match = re.search(r'file\s*:\s*["\']([^"\']+\.m3u8[^"\']*)["\']', content)
-            if match:
-                real_m3u8_url = match.group(1)
-                logger.info(f"[HLS-PROXY] [{channel or '?'}] extracted real m3u8: {real_m3u8_url}")
-                current_url = urljoin(final_url, real_m3u8_url)
-                req = urllib.request.Request(current_url, headers=headers)
-                with urllib.request.urlopen(req, timeout=IPTV_FETCH_TIMEOUT) as resp:
-                    final_url = resp.geturl()
-                    content_type = resp.headers.get("Content-Type", "") or ""
-                    raw2 = resp.read()
-
-                if raw2[:1] == b"G" and "html" not in content_type.lower():
-                    logger.info(
-                        f"[HLS-PROXY] [{channel or '?'}] non-HLS after extract "
-                        f"served as TS (len={len(raw2)}) target_url={target_url}"
-                    )
-                    return Response(content=raw2, media_type="video/mp2t")
-
-                content = _decode_body_gzip_aware(raw2)
-
-                if not content.strip().startswith("#EXTM3U"):
-                    logger.warning(
-                        f"[HLS-PROXY] [{channel or '?'}] non-HLS after extract "
-                        f"(ct={content_type!r}, len={len(content)}, "
-                        f"head={content[:100]!r}) target_url={target_url}"
-                    )
-                    return Response("Invalid HLS manifest", status_code=502)
-
-            else:
-                logger.warning(
-                    f"[HLS-PROXY] [{channel or '?'}] upstream non-HLS "
-                    f"(ct={content_type!r}, len={len(content)}, "
-                    f"head={content[:100]!r}) target_url={target_url}"
-                )
-                return Response("Not an HLS manifest", status_code=502)
-
-        _no_prefetch = request.query_params.get("no_prefetch") == "1" if request else False
-        _prefetch_allowed = False
-        if channel and not _no_prefetch:
-            try:
-                active_idx = state.get_active_index(channel)
-                _ch = state.get_channel(channel)
-                if _ch:
-                    _streams = _ch.get("streams", [])
-                    if 0 <= active_idx < len(_streams) and isinstance(_streams[active_idx], dict):
-                        _prefetch_allowed = bool(_streams[active_idx].get("prefetch", False))
-            except Exception:
-                pass
-
-        try:
-            from core.config import IPTV_PREFETCH_MAX_SEGMENTS
-            segment_urls = []
-            for _line in content.splitlines():
-                _s = _line.strip()
-                if not _s or _s.startswith("#"):
-                    continue
-                if ".m3u8" in _s.lower():
-                    continue
-                segment_urls.append(urljoin(final_url, _s))
-            if segment_urls:
-                segment_urls = segment_urls[-IPTV_PREFETCH_MAX_SEGMENTS:]
-            if segment_urls and _prefetch_allowed:
-                _pf_headers = {"User-Agent": unquote(ua) if ua else IPTV_DEFAULT_UA}
-                if referer:
-                    _pf_headers["Referer"] = unquote(referer)
-                if cookie:
-                    _pf_headers["Cookie"] = unquote(cookie)
-                schedule_prefetch(segment_urls, _pf_headers, channel=channel)
-        except Exception as _e:
-            logger.warning(f"[PREFETCH] schedule failed: {_e}")
-
-        proxy_base = str(request.base_url).rstrip('/')
-        modified_m3u8 = fix_hls_manifest(
-            manifest_text=content,
-            base_url=final_url,
-            referer=referer,
-            cookie=cookie,
-            ua=ua,
-            proxy_base_url=proxy_base,
-            channel=channel
-        )
-        modified_m3u8 = _override_master_bandwidth(modified_m3u8)
-        logger.debug(f"[HLS-PROXY] [{channel or '?'}] manifest proxied successfully: {target_url[:120]}")
-        _body = modified_m3u8.encode("utf-8")
-        return Response(
-            content=_body,
-            media_type="application/vnd.apple.mpegurl",
-            headers={
-                "Content-Length": str(len(_body)),
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Expires": "0",
-            }
-        )
-    except urllib.error.HTTPError as e:
-        logger.error(f"[HLS-PROXY] [{channel or '?'}] HTTP {e.code}: {e.reason} (url={url[:120]})")
-        return Response(f"Error fetching manifest: {e.code} {e.reason}", status_code=502)
-    except Exception as e:
-        logger.error(f"[HLS-PROXY] [{channel or '?'}] proxying failed ({url[:120]}): {e}")
-        return Response(f"Error proxying playlist: {e}", status_code=502)
-
-
-# segment-head-key-v1
-def _content_type_for_segment(target_url: str) -> str:
-    """Content-Type по расширению target URL.
-
-    Ключ AES-128 (.key) — 16 бинарных байт. ffmpeg ожидает
-    application/octet-stream. video/mp2t для ключа ломает парсер.
-    """
-    u = target_url.lower().split("?")[0]
-    if u.endswith(".key"):
-        return "application/octet-stream"
-    if u.endswith(".m3u8"):
-        return "application/vnd.apple.mpegurl"
-    if u.endswith((".ts", ".m4s", ".mp4", ".m4a", ".aac", ".ac3", ".vtt")):
-        return "video/mp2t"
-    # .mpd, .key, неизвестные — octet-stream безопаснее для бинарных
-    if u.endswith((".mpd", ".key", ".bin")):
-        return "application/octet-stream"
-    return "video/mp2t"
-
-
-# hls-ext-paths-v1
-# Универсальный роут: /hls/{name}.{ext}?url=...&referer=...&cookie=...&ua=...
-# ext определяет Content-Type и поведение (manifest или binary).
-# Старые /hls/manifest.m3u8 и /hls/segment.ts остаются ниже — для кэша.
-
-_MANIFEST_EXTS = ("m3u8", "mpd")
-_BINARY_EXTS = ("ts", "m4s", "mp4", "m4a", "aac", "ac3", "vtt", "key", "bin")
-
-
-@router.head("/hls/{name}.{ext}")
-def proxy_hls_by_ext_head(name: str, ext: str, url: str, request: Request,
-                          referer: str = None, cookie: str = None,
-                          ua: str = None, channel: str = None):
-    ext_l = ext.lower()
-    if ext_l == "key":
-        ct = "application/octet-stream"
-    elif ext_l == "vtt":
-        ct = "text/vtt"
-    elif ext_l in _MANIFEST_EXTS:
-        ct = "application/vnd.apple.mpegurl"
-    elif ext_l in _BINARY_EXTS:
-        ct = "video/mp2t"
-    else:
-        ct = "application/octet-stream"
-    return Response(status_code=200, media_type=ct,
-                    headers={"Accept-Ranges": "bytes"})
-
-
-@router.get("/hls/{name}.{ext}")
-def proxy_hls_by_ext(name: str, ext: str, url: str, request: Request,
-                     referer: str = None, cookie: str = None,
-                     ua: str = None, channel: str = None):
-    """Универсальный HLS-прокси. ext в пути — правильное расширение URL.
-
-    Для .m3u8/.mpd — проксируем манифест (переписываем вложенные URL).
-    Для .ts/.key/.vtt/.m4s/.mp4 — отдаём бинарь как есть.
-    """
-    if not channel:
-        channel = name
-    ext_l = ext.lower()
-    if ext_l in _MANIFEST_EXTS:
-        return proxy_hls_manifest(url=url, request=request, referer=referer,
-                                  cookie=cookie, ua=ua, channel=channel)
-    # бинарь: key/vtt/segment
-    return proxy_hls_segment(url=url, request=request, referer=referer,
-                             cookie=cookie, ua=ua, channel=channel)
-
-
-@router.head("/hls/segment.ts")
-def proxy_hls_segment_head(url: str, request: Request,
-                          referer: str = None, cookie: str = None,
-                          ua: str = None, channel: str = None):
-    """HEAD для /hls/segment.ts.
-
-    ffmpeg/ffprobe делают HEAD перед GET для определения размера и
-    типа. Раньше возвращали 405, и ffmpeg отказывался открывать ключ.
-    Отвечаем 200 без тела — с корректным Content-Type по расширению.
-    """
-    # url — сырой query-параметр (FastAPI декодировал). Проверим только
-    # расширение, содержимое не качаем.
-    target_url = url
-    ct = _content_type_for_segment(target_url)
-    return Response(
-        status_code=200,
-        media_type=ct,
-        headers={"Accept-Ranges": "bytes"},
-    )
-
-
-@router.get("/hls/segment.ts")
-def proxy_hls_segment(
-    url: str,
-    request: Request,
-    referer: str = None,
-    cookie: str = None,
-    ua: str = None,
-    channel: str = None,
-):
-    channel = sanitize_channel(channel, url)
-    if channel:
-        state.mark_channel_active(channel)
-    try:
-        if cookie in ("None", "null", ""): cookie = None
-        if ua in ("None", "null", ""): ua = None
-        if referer in ("None", "null", ""): referer = None
-        # unquote-fix-v1: FastAPI уже декодировал query-параметр.
-        # Повторный unquote ломает %2B -> '+' -> ' ' (пробел), CDN 404.
-        target_url = url
-        # segment-head-key-v1: Content-Type по расширению. Для .key —
-        # application/octet-stream, иначе ffmpeg не распарсит ключ AES-128.
-        _ct = _content_type_for_segment(target_url)
-        try:
-            cached = get_cached_segment(target_url)
-            if cached is not None:
-                logger.debug(
-                    f"[TS-PROXY] [{channel or '?'}] {len(cached)} bytes (prefetch): "
-                    f"{target_url[:100]}"
-                )
-                return Response(content=cached, media_type="video/mp2t")
-        except Exception as e:
-            logger.warning(f"[PREFETCH] cache read error: {e}")
-
-        headers = {"User-Agent": unquote(ua) if ua else IPTV_DEFAULT_UA}
-        if referer:
-            headers["Referer"] = unquote(referer)
-        if cookie:
-            headers["Cookie"] = unquote(cookie)
-
-        client_range = request.headers.get("range") if request else None
-        if client_range:
-            headers["Range"] = client_range
-
-        t0 = time.time()
-
-        try:
-            req = urllib.request.Request(target_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=IPTV_FETCH_TIMEOUT) as resp:
-                status_code = resp.status
-                resp_headers = resp.headers
-                try:
-                    data = resp.read()
-                except Exception as _read_err:
-                    partial = getattr(_read_err, "partial", None)
-                    if partial:
-                        logger.info(
-                            f"[TS-PROXY] [{channel or '?'}] incomplete read: "
-                            f"got {len(partial)} bytes, fetching remainder via Range"
-                        )
-                        data = partial
-                        # Дозапрашиваем остаток через Range. CDN tvcdnpotok
-                        # часто обрывает соединение на середине сегмента.
-                        # Без докачки Jellyfin получает обрезанный TS и
-                        # буферизует каждые 10 сек.
-                        try:
-                            h2 = dict(headers)
-                            h2["Range"] = f"bytes={len(data)}-"
-                            req2 = urllib.request.Request(target_url, headers=h2)
-                            with urllib.request.urlopen(req2, timeout=IPTV_FETCH_TIMEOUT) as resp2:
-                                try:
-                                    data += resp2.read()
-                                except Exception as _read_err2:
-                                    partial2 = getattr(_read_err2, "partial", None)
-                                    if partial2:
-                                        data += partial2
-                                    # второй обрыв — не критично, отдаём что есть
-                            logger.info(
-                                f"[TS-PROXY] [{channel or '?'}] remainder fetched, "
-                                f"total {len(data)} bytes"
-                            )
-                        except Exception as _rng_err:
-                            logger.warning(
-                                f"[TS-PROXY] [{channel or '?'}] Range fetch failed: "
-                                f"{_rng_err}, serving partial {len(data)} bytes"
-                            )
-                    else:
-                        raise
-        except urllib.error.HTTPError as e:
-            # remove-flare-from-segments-v1:
-            # FlareSolverr убран из прокси сегментов/ключей. Он возвращает
-            # solution.response как UTF-8 строку — бинарные TS и ключи
-            # портятся. Плюс запускает Chromium на каждый сегмент.
-            # Уместен только в резолвере (поиск m3u8 на HTML-странице).
-            logger.error(f"[TS-PROXY] [{channel or '?'}] HTTP {e.code}: {target_url[:120]}")
-            return Response(f"Upstream error: {e.code}", status_code=502)
-        except Exception as e:
-            logger.error(f"[TS-PROXY] [{channel or '?'}] {type(e).__name__}: {e} ({target_url[:120]})")
-            return Response(f"Upstream error: {e}", status_code=502)
-
-        elapsed = time.time() - t0
-        content_type = resp_headers.get("Content-Type", "video/mp2t") or "video/mp2t"
-
-        response_headers = {}
-        if resp_headers.get("Content-Range"):
-            response_headers["Content-Range"] = resp_headers["Content-Range"]
-        if resp_headers.get("Accept-Ranges"):
-            response_headers["Accept-Ranges"] = resp_headers["Accept-Ranges"]
-
-        logger.debug(
-            f"[TS-PROXY] [{channel or '?'}] {len(data)} bytes, status={status_code}, "
-            f"in {elapsed:.2f}s: {target_url[:100]}"
-        )
-        response_headers["Content-Length"] = str(len(data))
-        # segment-head-key-v1: если upstream отдал text/plain или пусто —
-        # не доверяем ему, ставим свой Content-Type по расширению.
-        # Для .key upstream часто отдаёт application/octet-stream — тогда
-        # берём его. Иначе — наш _ct.
-        # force-key-ct-v1: для .key ВСЕГДА наш application/octet-stream.
-        # Pluto (и, возможно, другие) отдаёт для ключа Content-Type
-        # application/vnd.apple.mpegurl — это неверно, ffmpeg ломается.
-        _is_key = target_url.lower().split("?")[0].endswith(".key")
-        if _is_key:
-            _final_ct = "application/octet-stream"
-        else:
-            _upstream_ct = content_type or ""
-            if _upstream_ct.startswith("video/") or _upstream_ct.startswith("application/"):
-                _final_ct = _upstream_ct
-            else:
-                _final_ct = _ct
-        return Response(
-            content=data,
-            media_type=_final_ct,
-            status_code=status_code,
-            headers=response_headers,
-        )
-    except Exception as e:
-        logger.error(f"[TS-PROXY] [{channel or '?'}] {type(e).__name__}: {e} ({url[:100]})")
-        return Response(f"Error: {e}", status_code=502)
-
-
-@router.get("/mux/{name}.ts")
-async def mux_stream(name: str, request: Request):
-    logger.info(f"[MUX] '{name}': mux requested")
-    state.mark_channel_active(name)
-
-    cached_stream = None
-    idx = state.get_active_index(name)
-    with state.cache_lock:
-        entry = state._epg_cache.get(name, {})
-        if isinstance(entry, dict):
-            streams = entry.get("streams_cache", [])
-            if isinstance(idx, int) and 0 <= idx < len(streams) and isinstance(streams[idx], dict):
-                cached_stream = streams[idx].get("cached_stream")
-
-    if not cached_stream:
-        logger.warning(f"[MUX] '{name}': cache empty, re-resolving")
-        try:
-            is_direct, payload, expire_time, method = await asyncio.wait_for(
-                asyncio.to_thread(state.get_channel_stream, name),
-                timeout=30.0,
-            )
-            cached_stream = payload
-            logger.info(f"[MUX] '{name}': re-resolved, {cached_stream[:80]}...")
-        except asyncio.TimeoutError:
-            logger.error(f"[MUX] '{name}': resolve timeout (>30s)")
-            return Response("Resolve timeout", status_code=504)
-        except Exception as e:
-            logger.error(f"[MUX] '{name}': re-resolve failed: {e}")
-            return Response("No cached stream", status_code=404)
-
-    if cached_stream.startswith("#EXTM3U"):
-        lines = cached_stream.splitlines()
-        video_url = None
-        audio_url = None
-        for line in lines:
-            if line.startswith("#EXT-X-MEDIA") and "TYPE=AUDIO" in line:
-                m = re.search(r'URI="([^"]+)"', line)
-                if m:
-                    audio_url = m.group(1)
-            elif not line.startswith("#") and line.strip() and video_url is None:
-                video_url = line.strip()
-        if not video_url or not audio_url:
-            return Response("Cannot parse synthetic manifest", status_code=404)
-
-        logger.info(f"[MUX] '{name}': synthetic manifest, video={video_url[:80]}, audio={audio_url[:80]}")
-        mux_proc = get_or_create_mux(name, video_url, audio_url, IPTV_DEFAULT_UA)
-    else:
-        clean_url, headers_dict = parse_url_headers(cached_stream)
-        if ".m3u8" not in clean_url:
-            return Response("Not an HLS stream", status_code=400)
-
-        referer_str = headers_dict.get("Referer", "") if isinstance(headers_dict, dict) else ""
-        cookie_str = headers_dict.get("Cookie", "") if isinstance(headers_dict, dict) else ""
-        user_agent = headers_dict.get("User-Agent", IPTV_DEFAULT_UA) if isinstance(headers_dict, dict) else IPTV_DEFAULT_UA
-
-        headers = {"User-Agent": user_agent}
-        if referer_str:
-            headers["Referer"] = referer_str
-        if cookie_str:
-            headers["Cookie"] = cookie_str
-
-        try:
-            req = urllib.request.Request(clean_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=IPTV_FETCH_TIMEOUT) as resp:
-                manifest_text = read_response_text(resp)
-        except Exception as e:
-            logger.error(f"[MUX] '{name}': master.m3u8 load error: {e}")
-            return Response("Failed to load master manifest", status_code=404)
-
-        lines = manifest_text.splitlines()
-        video_url = None
-        audio_url = None
-        max_bw = -1
-
-        # mux-all-v1: если в master нет #EXT-X-MEDIA:TYPE=AUDIO —
-        # single-input режим (video_url сам содержит A+V).
-        has_audio_group = any(
-            line.strip().startswith("#EXT-X-MEDIA") and "TYPE=AUDIO" in line
-            for line in lines
-        )
-        if has_audio_group:
-            for line in lines:
-                if line.strip().startswith("#EXT-X-MEDIA") and "TYPE=AUDIO" in line:
-                    m = re.search(r'URI="([^"]+)"', line)
-                    if m:
-                        audio_url = urljoin(clean_url, m.group(1))
-                        break
-
-        for i, line in enumerate(lines):
-            if line.strip().startswith("#EXT-X-STREAM-INF"):
-                bw_match = re.search(r'BANDWIDTH=(\d+)', line)
-                if bw_match:
-                    bw = int(bw_match.group(1))
-                    if bw > max_bw and i + 1 < len(lines):
-                        candidate = lines[i+1].strip()
-                        if not candidate.startswith("#"):
-                            max_bw = bw
-                            video_url = urljoin(clean_url, candidate)
-
-        # mux-all-v1: video обязателен, audio — опционально (single-input).
-        if not video_url:
-            return Response("Cannot find video in master", status_code=404)
-
-        logger.info(f"[MUX] '{name}': video={video_url[:80]}, audio={(audio_url or '(none)')[:80]}")
-        mux_proc = get_or_create_mux(name, video_url, audio_url, user_agent, referer_str, cookie_str)
-
-    # q инициализируем None: если subscribe() упадёт, finally не сломается
-    # на NameError, а корректно пропустит unsubscribe.
-    q = None
-    q = mux_proc.subscribe()
-
-    async def stream_generator():
-        # MUX-BATCH-READ: q — asyncio.Queue, читаем напрямую через await q.get(),
-        # без thread-hop. После первого чанка забираем всё, что уже накопилось
-        # (get_nowait), чтобы уменьшить число yield-переключений event loop.
-        empty_count = 0
-        try:
-            while True:
-                batch = []
-                try:
-                    chunk = await asyncio.wait_for(q.get(), timeout=1.0)
-                    batch.append(chunk)
-                    # Добираем всё, что уже в очереди, без блокировки
-                    while True:
-                        try:
-                            nxt = q.get_nowait()
-                            batch.append(nxt)
-                        except asyncio.QueueEmpty:
-                            break
-                    empty_count = 0
-                except asyncio.TimeoutError:
-                    empty_count += 1
-                    if empty_count >= 30:
-                        logger.warning(f"[MUX] '{name}': no data for 30s, closing stream")
-                        break
-                    continue
-
-                stop = False
-                for chunk in batch:
-                    if chunk is None:
-                        stop = True
-                        break
-                    yield chunk
-                if stop:
-                    break
-        except asyncio.CancelledError:
-            pass
-        finally:
-            if q is not None:
-                mux_proc.unsubscribe(q)
-
-    return StreamingResponse(
-        stream_generator(),
-        media_type="video/mp2t",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0"
-        }
-    )
-
-
 @router.get("/synthetic/{name}.m3u8")
 def synthetic_manifest(name: str):
     state.cleanup_expired_caches()
@@ -882,11 +339,9 @@ def synthetic_manifest(name: str):
                     return Response(payload, media_type="application/vnd.apple.mpegurl")
     return Response("Not available, re-resolve channel first", status_code=404)
 
-
 @router.head("/redirect/{name}")
 def redirect_channel_head(name: str):
     return Response(status_code=200)
-
 
 @router.get("/black.ts")
 def serve_black_ts():
@@ -901,10 +356,11 @@ def serve_black_ts():
         headers={"Cache-Control": "public, max-age=86400"},
     )
 
-
 @router.head("/black.ts")
 def serve_black_ts_head():
     return Response(
         media_type="video/mp2t",
         headers={"Cache-Control": "public, max-age=86400"},
     )
+
+# stream-refactor-v1

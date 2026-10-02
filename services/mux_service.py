@@ -4,6 +4,7 @@ import asyncio
 import time
 
 from core.config import logger, IPTV_MUX_MAX_PROCESSES, IPTV_MUX_IDLE_TIMEOUT, IPTV_FFMPEG_LOG_LEVEL
+# mux-debug-cleanup-v1
 
 _mux_lock = threading.Lock()
 _mux_processes = {}  # name -> MuxProcess
@@ -20,6 +21,32 @@ _MUX_START_GRACE = 120
 _QUEUE_FULL_LOG_INTERVAL = 1.0
 
 
+# mux-reuse-base-url-v1
+def _url_base(url: str) -> str:
+    """Базовая часть URL: host + путь до .m3u8/.ts, без query и без
+    signed-хвостов. Сравниваем по ней, чтобы не убивать мукс при
+    смене только sec2(...)/token=/expires=.
+
+    Пример:
+      https://live2...dmcdn.net/sec2(AbC123)/cloud/3/xyz/d/live-720.m3u8?startdate=...
+      → https://live2...dmcdn.net/cloud/3/xyz/d/live-720.m3u8
+
+    Параметры sec2(...) вырезаются как часть пути.
+    """
+    if not url:
+        return ""
+    import re as _re
+    from urllib.parse import urlparse as _urlparse
+    u = url.split("|", 1)[0]
+    p = _urlparse(u)
+    path = p.path
+    # Вырезаем sec2(...) — signed-хвост пути.
+    path = _re.sub(r"/sec2\([^)]*\)", "", path)
+    # Также вырезаем /sign/..., /key/..., /iv/... — часть signed-обёрток Pluto.
+    # Оставляем только смысловые компоненты.
+    return f"{p.scheme}://{p.netloc}{path}"
+
+
 class MuxProcess:
     # single-input-mux-v1
     def __init__(self, name, video_url, audio_url, ua, referer=None, cookie=None):
@@ -28,6 +55,7 @@ class MuxProcess:
         # их с новым запросом: если URL/headers/cookies расходятся,
         # старый процесс читает протухший источник и его надо убить.
         self.video_url = video_url
+        self.video_url_base = _url_base(video_url)
         self.audio_url = audio_url
         self.ua = ua
         self.referer = referer
@@ -236,6 +264,7 @@ class MuxProcess:
             while True:
                 chunk = self.proc.stdout.read1(65536)
                 if not chunk:
+                    logger.info(f"[MUX] '{self.name}': ffmpeg stdout closed (EOF)")
                     break
                 self.last_data_time = time.time()
                 with self.subscribers_lock:
@@ -282,11 +311,9 @@ class MuxProcess:
         q = asyncio.Queue(maxsize=2000)
         try:
             self._loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # subscribe вызван из sync-контекста — крайне маловероятно
-            # (mux_stream в routers/stream.py — async def). Оставляем
-            # self._loop как None, put будет через прямой put_nowait.
+        except RuntimeError as _e:
             self._loop = None
+            logger.warning(f"[MUX] '{self.name}': subscribe without running loop: {_e}")
         with self.subscribers_lock:
             self.subscribers.append(q)
         self.last_activity = time.time()
@@ -345,15 +372,29 @@ def get_or_create_mux(name, video_url, audio_url, ua, referer=None, cookie=None)
         )
 
         if existing and alive:
+            # mux-reuse-base-url-v1: сравниваем базовый URL (без signed
+            # sec2/token/query), а не полный. Иначе sniffer каждые 30 сек
+            # возвращает новый signed URL → kill ffmpeg → обрыв стрима.
+            #
+            # headers/ua/cookie сравниваем по-прежнему полностью — смена
+            # Cookie означает смену сессии, тут нужен новый ffmpeg.
+            existing_base = getattr(existing, "video_url_base", "") or _url_base(existing.video_url)
+            new_base = _url_base(video_url)
             same = (
-                existing.video_url == video_url
+                existing_base == new_base
                 and (existing.audio_url or "") == (audio_url or "")
                 and (existing.ua or "") == (ua or "")
                 and (existing.referer or "") == (referer or "")
                 and (existing.cookie or "") == (cookie or "")
             )
             if same:
-                logger.info(f"[MUX] '{name}': reuse (params same)")
+                if existing.video_url != video_url:
+                    logger.info(
+                        f"[MUX] '{name}': reuse (base same, signed URL updated "
+                        f"{existing.video_url[:40]}... -> {video_url[:40]}...)"
+                    )
+                else:
+                    logger.info(f"[MUX] '{name}': reuse (params same)")
                 return existing
             # Параметры разошлись — старый ffmpeg читает протухшие URL.
             # Именно это даёт «только видео» или «только звук»: один вход

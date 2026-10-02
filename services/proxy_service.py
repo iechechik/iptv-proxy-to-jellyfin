@@ -323,3 +323,18 @@ def sanitize_channel(channel: str | None, base_url: str | None = None) -> str | 
             return None
 
     return channel
+
+
+# stream-refactor-v1: вынесен из routers/stream.py
+BLACK_MANIFEST = (
+    "#EXTM3U\n"
+    "#EXT-X-VERSION:3\n"
+    "#EXT-X-PLAYLIST-TYPE:VOD\n"
+    "#EXT-X-TARGETDURATION:6\n"
+    "#EXT-X-MEDIA-SEQUENCE:0\n"
+    "#EXTINF:5.0,\n"
+    "/black.ts\n"
+    "#EXT-X-ENDLIST\n"
+)
+
+

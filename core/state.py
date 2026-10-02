@@ -5,7 +5,10 @@ import threading
 import re
 import copy
 import secrets
-from core.config import IPTV_CACHE_FILE, IPTV_DEFAULT_UA, logger, IPTV_BACKUP_FILE, save_full_config
+from core.config import (
+    IPTV_CACHE_FILE, IPTV_DEFAULT_UA, logger, IPTV_BACKUP_FILE, save_full_config,
+    IPTV_JELLYFIN_MEDIAINFO_DIR, IPTV_MANAGE_URL,
+)
 from services.mux_service import invalidate_mux
 
 # CONFIG_DATA читаем динамически через _cfg.CONFIG_DATA: reload_config
@@ -63,6 +66,11 @@ _loop = None
 _healthcheck_tasks = {}
 _healthcheck_lock = threading.Lock()
 
+# channel-events-state-v1
+# Предыдущее состояние здоровья канала (для логов UP -> DOWN / DOWN -> UP).
+# {"up", "down"} — из healthcheck. Пишется в channel_events.log при переходах.
+_channel_health_state = {}
+
 
 def invalidate_channels_cache():
     global _channels_memory
@@ -97,6 +105,87 @@ def pop_failed_resolve_for_channel(name: str) -> int:
             _failed_resolve_cache.pop(key, None)
             removed += 1
         return removed
+
+
+# channel-events-state-marks-v1
+def _log_health_transition(name: str, new_state: str, source: str) -> None:
+    """Пишет UP -> DOWN / DOWN -> UP в channel_events.log при переходах.
+    Вызывается из mark_channel_healthy/unhealthy. Не пишет, если
+    состояние не изменилось."""
+    prev = _channel_health_state.get(name)
+    if prev == new_state:
+        return
+    try:
+        from services.channel_events import log_state
+        if new_state == "down" and prev != "down":
+            log_state(name, "UP -> DOWN", source)
+        elif new_state == "up" and prev == "down":
+            log_state(name, "DOWN -> UP", source)
+    except Exception as e:
+        logger.warning(f"[EVENTS] '{name}': health transition log failed: {e}")
+    _channel_health_state[name] = new_state
+
+
+# mediainfo-invalidate-v1
+def invalidate_jellyfin_mediainfo(name: str, reason: str = "") -> int:
+    """Удаляет mediainfo-кэш Jellyfin для канала {name}.
+
+    Jellyfin при первом probe канала сохраняет в cache/mediainfo/*.json
+    поле Container (hls|ts). При последующих открытиях не перепроверяет,
+    использует закэшированный -f. Если канал сменил режим доставки
+    (HLS ↔ raw TS через мукс), старый файл ломает воспроизведение
+    (ffmpeg exit 183 - Invalid data found).
+
+    Удаляем файлы, у которых Path начинается с
+    "{IPTV_MANAGE_URL}/redirect/{name}". Это покроет все варианты
+    расширений (.m3u8, .ts, без расширения) и старые артефакты.
+    Медиатека (фильмы, музыка, фото) имеет другие Path — не задеваем.
+
+    Папка монтируется в контейнер как /jellyfin-mediainfo-cache.
+    Если папки нет — тихо выходим.
+
+    Возвращает число удалённых файлов.
+    """
+    if not name:
+        return 0
+    import os as _os
+    import glob as _glob
+    import json as _json
+
+    folder = IPTV_JELLYFIN_MEDIAINFO_DIR
+    if not folder or not _os.path.isdir(folder):
+        logger.debug(f"[MEDIAINFO] '{name}': folder not available ({folder}), skip")
+        return 0
+
+    prefix = f"{IPTV_MANAGE_URL}/redirect/{name}"
+    removed = 0
+    errors = 0
+    for path in _glob.glob(_os.path.join(folder, "*.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+        except Exception:
+            continue
+        try:
+            p = data.get("Path") or ""
+        except Exception:
+            continue
+        if not isinstance(p, str) or not p.startswith(prefix):
+            continue
+        try:
+            _os.remove(path)
+            removed += 1
+            logger.info(f"[MEDIAINFO] '{name}': removed {_os.path.basename(path)} (Path={p})")
+        except Exception as e:
+            errors += 1
+            logger.warning(f"[MEDIAINFO] '{name}': failed to remove {_os.path.basename(path)}: {e}")
+
+    if removed or errors:
+        logger.info(
+            f"[MEDIAINFO] '{name}': invalidated {removed} file(s), errors {errors} "
+            f"(reason: {reason or 'unknown'})"
+        )
+    return removed
 
 
 def get_max_chno(channels):
@@ -620,7 +709,7 @@ def get_channel_stream(name: str):
     return is_direct, payload, expire_time, method
 
 
-def set_active_stream_index(name: str, new_index: int):
+def set_active_stream_index(name: str, new_index: int, source: str = "unknown"):
     # Смена активного стрима = старый мукс читает мёртвый источник.
     # Убиваем мукс ПЕРВЫМ, до обновления active_index и до снятия
     # channels_lock.
@@ -667,6 +756,24 @@ def set_active_stream_index(name: str, new_index: int):
 
     save_cache()
 
+    # channel-events-state-v1: при автоматическом переключении (healthcheck,
+    # fallback) пишем событие. При source="ui" — не пишем, роутер сам
+    # залогирует cfg: active_stream: old -> new.
+    if source not in ("ui", "unknown"):
+        try:
+            from services.channel_events import log_state
+            log_state(name, f"active_stream switched: {new_index}", source)
+        except Exception as _e:
+            logger.warning(f"[EVENTS] '{name}': switch event log failed: {_e}")
+
+    # mediainfo-invalidate-v1: смена активного стрима всегда потенциально
+    # меняет режим доставки (HLS ↔ raw TS). Удаляем mediainfo-кэш Jellyfin,
+    # чтобы при следующем открытии канала он сделал свежий probe.
+    try:
+        invalidate_jellyfin_mediainfo(name, reason="set_active_stream_index")
+    except Exception as _e:
+        logger.warning(f"[MEDIAINFO] '{name}': invalidate from set_active_stream_index failed: {_e}")
+
 
 def update_probe_elapsed_in_cache(name: str, index: int, probe_elapsed: float):
     with cache_lock:
@@ -682,8 +789,9 @@ def update_probe_elapsed_in_cache(name: str, index: int, probe_elapsed: float):
     save_cache()
 
 
-def mark_channel_healthy(name: str, method: str = "probe"):
+def mark_channel_healthy(name: str, method: str = "probe", source: str = "ui"):
     """Отмечает успешную проверку активного слота канала + чистит _failed_resolve_cache."""
+    _log_health_transition(name, "up", source)
     idx = get_active_index(name)
     with cache_lock:
         _last_active[name] = time.time()
@@ -703,10 +811,11 @@ def mark_channel_healthy(name: str, method: str = "probe"):
 
         pop_failed_resolve_for_channel(name)
 
-def mark_channel_unhealthy(name: str, detail: str = "Probe failed"):
+def mark_channel_unhealthy(name: str, detail: str = "Probe failed", source: str = "ui"):
     """Симметрично mark_channel_healthy: пишет failure в активный слот.
     Не чистит _failed_resolve_cache (мы не знаем, был ли резолв неудачным)
     и не трогает _last_active. Задача — отразить результат probe в UI."""
+    _log_health_transition(name, "down", source)
     idx = get_active_index(name)
     with cache_lock:
         if name not in _epg_cache or not isinstance(_epg_cache[name], dict):

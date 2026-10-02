@@ -135,6 +135,9 @@ def _pick_best_candidate(candidates: list, channel_name: str = None):
 
 def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int, skip_urls: set = None) -> Optional[Dict[str, str]]:
     candidates: list = []
+    found_result = None  # sniffer-unbound-fix-v1: без этого UnboundLocalError
+                         # на return, если try упал до присваивания.
+    found_result = None
     master_seen_ts: float = 0.0
     _skip_urls = skip_urls or set()
     user_agent = ua or IPTV_DEFAULT_UA
@@ -161,7 +164,14 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int, skip_u
             }
             if os.path.exists(exec_path):
                 launch_args["executable_path"] = exec_path
-            browser = p.chromium.launch(**launch_args)
+            try:
+                browser = p.chromium.launch(**launch_args)
+            except Exception as _le:
+                logger.warning(
+                    f"[SNIFFER] chromium launch failed: {type(_le).__name__}: {_le} "
+                    f"(exec_path={exec_path}, exists={os.path.exists(exec_path)})"
+                )
+                raise
             context = browser.new_context(
                 user_agent=user_agent,
                 viewport={"width": 1280, "height": 720},

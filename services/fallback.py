@@ -102,7 +102,7 @@ def try_switch_to_healthy_stream(name: str) -> bool:
             _fallback_in_progress.discard(name)
 
 def _do_switch(name: str, new_index: int):
-    state.set_active_stream_index(name, new_index)
+    state.set_active_stream_index(name, new_index, source="fallback")
     state.pop_failed_resolve_for_channel(name)
 
     # Кулдаун обновляем под тем же локом, под которым его читает
