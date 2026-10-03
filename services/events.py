@@ -40,7 +40,17 @@ def send_broadcast_async(name=None, status_data=None, event_type="status-update"
     if state._loop is None:
         logger.warning("[SSE] event loop not initialized")
         return
-    asyncio.run_coroutine_threadsafe(broadcast_update(name, status_data, event_type, extra_data), state._loop)
+    # B5: при рестарте uvicorn loop закрывается раньше, чем успевают
+    # догореть фоновые потоки (healthcheck, EPG updater, playlist updater).
+    # run_coroutine_threadsafe в этот момент бросает RuntimeError. Раньше
+    # это валило вызывающий поток (например, worker healthcheck) с трейсбеком
+    # в логе. Теперь — тихо пропускаем, событие просто не уйдёт в SSE.
+    try:
+        asyncio.run_coroutine_threadsafe(broadcast_update(name, status_data, event_type, extra_data), state._loop)
+    except RuntimeError as e:
+        logger.debug(f"[SSE] broadcast dropped (loop closed?): {e}")
+    except Exception as e:
+        logger.warning(f"[SSE] broadcast failed: {e}")
 
 def save_cache_and_broadcast(name: str, status_data: dict):
     state.save_cache()

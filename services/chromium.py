@@ -90,25 +90,16 @@ def _pick_best_candidate(candidates: list, channel_name: str = None):
     for c in candidates:
         if c.get("type") == "embed":
             return c
-    ad_vids = set()
-    for c in candidates:
-        if c.get("is_ad"):
-            v = _extract_video_id(c.get("url", ""))
-            if v:
-                ad_vids.add(v)
-    if ad_vids:
-        logger.info(f"[SNIFFER] {tag}ad video_ids: {sorted(ad_vids)}")
+    # A2: убран двойной отсев AD. Единственный критерий — флаг is_ad,
+    # который проставляется в handle_request через _is_ad_url. Раньше был
+    # второй фильтр по vid (сравнение ad_vids с _extract_video_id мастера),
+    # но _extract_video_id для не-YouTube URL часто возвращает "" — и
+    # AD-мастер проходил. Один надёжный фильтр вместо двух ненадёжных.
     masters = [c for c in candidates
                if c.get("type") == "m3u8" and c.get("is_master") and not c.get("is_ad")]
     medias = [c for c in candidates
               if c.get("type") == "m3u8" and c.get("is_media") and not c.get("is_ad")]
-    filtered_masters = []
-    for c in masters:
-        vid = _extract_video_id(c.get("url", ""))
-        if vid and vid in ad_vids:
-            logger.info(f"[SNIFFER] {tag}master dropped (vid={vid!r} == ad): {c['url'][:120]}")
-            continue
-        filtered_masters.append(c)
+    filtered_masters = masters
     if filtered_masters and medias:
         m_host = _root_host(filtered_masters[-1].get("url", ""))
         d_host = _root_host(medias[-1].get("url", ""))

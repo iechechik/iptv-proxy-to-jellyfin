@@ -412,9 +412,74 @@ _TMP_CLEANUP_INTERVAL_SEC = 600  # 10 минут
 _last_tmp_cleanup = 0.0
 
 
+def _read_proc_stat(pid: int):
+    """Читает /proc/<pid>/stat и /proc/<pid>/cmdline, возвращает dict или None.
+
+    Формат /proc/<pid>/stat (man 5 proc):
+      pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt
+      majflt cmajflt utime stime cutime cstime priority nice num_threads
+      itrealvalue starttime ...
+    comm в скобках — единственное поле, содержащее пробелы и скобки.
+    Поэтому split идёт от последней ')': всё до неё — comm, дальше state.
+    """
+    import os as _os
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="ignore") as f:
+            raw = f.read()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return None
+    except Exception:
+        return None
+
+    rparen = raw.rfind(")")
+    if rparen < 0:
+        return None
+    comm = raw[raw.find("(") + 1:rparen]
+    rest = raw[rparen + 2:].split()
+    if len(rest) < 20:
+        return None
+    state = rest[0]
+    try:
+        ppid = int(rest[1])
+        starttime_ticks = int(rest[19])
+    except ValueError:
+        return None
+
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read().replace(chr(0).encode(), b" ").decode("utf-8", errors="ignore")
+    except Exception:
+        cmdline = ""
+
+    return {
+        "pid": pid,
+        "comm": comm,
+        "state": state,
+        "ppid": ppid,
+        "starttime_ticks": starttime_ticks,
+        "cmdline": cmdline,
+    }
+
+
+def _system_hz() -> int:
+    """Обычно 100 на Linux. Читаем из getconf или возвращаем 100."""
+    try:
+        import subprocess as _sp
+        out = _sp.run(["getconf", "CLK_TCK"], capture_output=True, text=True, timeout=2)
+        return int(out.stdout.strip())
+    except Exception:
+        return 100
+
+
 def _kill_stale_chromium(max_age_sec: int = 300):
     """Убивает ЗАВИСШИЕ (не зомби) процессы Chromium/headless_shell
     старше max_age_sec.
+
+    # C6: читаем /proc/<pid>/stat напрямую вместо subprocess.run(["ps"]).
+    # ps = fork + exec + парсинг таблицы сотен процессов каждые 60 сек.
+    # /proc/*/stat — просто чтение файлов, без fork. В 10-20 раз дешевле.
+    # Особенно важно, когда одновременно работают Chromium-процессы
+    # (fork в этот момент конкурирует за CPU и память).
 
     # tini-init-v1
     Зомби-процессы (defunct) собирает tini (PID 1 в контейнере). Они
@@ -430,7 +495,6 @@ def _kill_stale_chromium(max_age_sec: int = 300):
     Порог 300 сек: живой sniffer с максимальными таймаутами
     (navigation 40 + wait 15 + закрытие) не дотянет до него.
     """
-    import subprocess as _sp
     import os as _os
     import signal as _sig
 
@@ -439,44 +503,52 @@ def _kill_stale_chromium(max_age_sec: int = 300):
     patterns = ("headless_shell", "chrome", "chromium")
 
     try:
-        out = _sp.run(
-            ["ps", "-eo", "pid=,etimes=,ppid=,stat=,comm=,args="],
-            capture_output=True, text=True, timeout=5,
-        ).stdout
+        with open("/proc/uptime", "r") as f:
+            uptime_sec = float(f.read().split()[0])
     except Exception as e:
-        logger.warning(f"[CLEANUP] ps failed: {e}")
+        logger.warning(f"[CLEANUP] /proc/uptime read failed: {e}")
         return
 
-    for line in out.splitlines():
-        parts = line.strip().split(None, 5)
-        if len(parts) < 6:
-            continue
-        try:
-            pid = int(parts[0])
-            etimes = int(parts[1])
-            ppid = int(parts[2])
-        except ValueError:
-            continue
-        stat = parts[3]
-        comm = parts[4]
-        args = parts[5]
+    hz = _system_hz()
 
-        # Зомби не трогаем — их собирает tini.
-        if "Z" in stat:
-            continue
+    try:
+        proc_entries = _os.listdir("/proc")
+    except Exception as e:
+        logger.warning(f"[CLEANUP] /proc listdir failed: {e}")
+        return
 
-        if not any(p in comm or p in args for p in patterns):
+    for entry in proc_entries:
+        if not entry.isdigit():
             continue
+        pid = int(entry)
         if pid == my_pid:
             continue
+
+        st = _read_proc_stat(pid)
+        if st is None:
+            continue
+
+        if st["state"] == "Z":
+            continue
+
+        try:
+            etimes = int(uptime_sec - st["starttime_ticks"] / hz)
+        except Exception:
+            continue
+
         if etimes < max_age_sec:
             continue
 
-        # Активные sniffer'ы — дети нашего Python. Не убиваем.
+        comm = st["comm"]
+        cmdline = st["cmdline"]
+        if not any(pat in comm or pat in cmdline for pat in patterns):
+            continue
+
+        ppid = st["ppid"]
         if ppid == my_pid:
             logger.info(
                 f"[CLEANUP] skip pid={pid} (etimes={etimes}s, ppid={ppid} = us, "
-                f"stat={stat}) — активный sniffer"
+                f"state={st['state']}) — активный sniffer"
             )
             continue
 
@@ -485,7 +557,7 @@ def _kill_stale_chromium(max_age_sec: int = 300):
             killed += 1
             logger.warning(
                 f"[CLEANUP] killed stale chromium pid={pid} "
-                f"(etimes={etimes}s, ppid={ppid}, stat={stat}, comm={comm})"
+                f"(etimes={etimes}s, ppid={ppid}, state={st['state']}, comm={comm})"
             )
         except Exception as e:
             logger.debug(f"[CLEANUP] kill pid={pid} failed: {e}")

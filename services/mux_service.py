@@ -44,6 +44,15 @@ def _url_base(url: str) -> str:
     path = _re.sub(r"/sec2\([^)]*\)", "", path)
     # Также вырезаем /sign/..., /key/..., /iv/... — часть signed-обёрток Pluto.
     # Оставляем только смысловые компоненты.
+    #
+    # mux-base-strip-file-v1: отрезаем имя .m3u8-файла.
+    # Pluto (и некоторые другие CDN) могут переключить варианты
+    # master.m3u8 / master_5.m3u8 / master_caption.m3u8 при
+    # перебалансировке. Если сравнивать полный path, base разойдётся,
+    # мукс убьётся и создастся заново — лишний обрыв клиента.
+    # Сравниваем только host + путь до файла.
+    if path.endswith(".m3u8"):
+        path = path.rsplit("/", 1)[0]
     return f"{p.scheme}://{p.netloc}{path}"
 
 
@@ -401,7 +410,7 @@ def get_or_create_mux(name, video_url, audio_url, ua, referer=None, cookie=None)
             # 403-ит, второй кое-как проскакивает. Убиваем, стартуем свежий.
             logger.info(
                 f"[MUX] '{name}': params changed, recreating "
-                f"(old_v={existing.video_url[:60]} new_v={video_url[:60]})"
+                f"(old_v={existing.video_url[:200]} new_v={video_url[:200]})"
             )
             existing.stop()
             _mux_processes.pop(name, None)

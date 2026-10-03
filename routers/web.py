@@ -21,8 +21,18 @@ def manage_page(request: Request):
     rows = []
     source_name_map = epg_manager.get_channel_source_name_map()
 
+    # C4: копируем из _epg_cache только слоты текущих каналов, а не весь
+    # _epg_cache. cache_lock держится всё время копирования; при большом
+    # числе каналов (500+) полное копирование блокирует healthcheck,
+    # stream и прочее. Оставшиеся в _epg_cache "мёртвые" имена (после
+    # rename/delete, если их не подчистили) нам тут не нужны.
+    _ch_names = {ch["name"] for ch in channels}
     with state.cache_lock:
-        epg_cache_snapshot = {name: dict(entry) for name, entry in state._epg_cache.items()}
+        epg_cache_snapshot = {
+            name: dict(entry)
+            for name, entry in state._epg_cache.items()
+            if name in _ch_names
+        }
 
     for ch in channels:
         channel_name = ch["name"]

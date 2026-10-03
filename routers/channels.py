@@ -260,6 +260,15 @@ async def delete_channel(request: Request):
             sorted_channels = state.sort_channels_by_chno(new_channels)
             state.save_channels_to_file(sorted_channels)
 
+        # A6: удаляем mediainfo Jellyfin для удаляемого канала. Иначе
+        # при пересоздании канала с тем же именем Jellyfin возьмёт старый
+        # Container (hls или ts) из mediainfo/*.json и сломается, если
+        # режим доставки изменится.
+        try:
+            state.invalidate_jellyfin_mediainfo(name_to_delete, reason="channel deleted")
+        except Exception as _e:
+            logger.warning(f"[MEDIAINFO] '{name_to_delete}': invalidate on delete failed: {_e}")
+
         with state.cache_lock:
             state._epg_cache.pop(name_to_delete, None)
             state.pop_failed_resolve_for_channel(name_to_delete)

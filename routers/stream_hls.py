@@ -72,7 +72,9 @@ def _content_type_for_segment(target_url: str) -> str:
         return "application/octet-stream"
     if u.endswith(".m3u8"):
         return "application/vnd.apple.mpegurl"
-    if u.endswith((".ts", ".m4s", ".mp4", ".m4a", ".aac", ".ac3", ".vtt")):
+    if u.endswith(".vtt"):
+        return "text/vtt"
+    if u.endswith((".ts", ".m4s", ".mp4", ".m4a", ".aac", ".ac3")):
         return "video/mp2t"
     if u.endswith((".mpd", ".key", ".bin")):
         return "application/octet-stream"
