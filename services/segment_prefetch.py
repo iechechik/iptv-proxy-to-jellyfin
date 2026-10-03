@@ -63,6 +63,27 @@ MAX_IN_PROGRESS = 30
 _fetch_semaphore = threading.Semaphore(IPTV_PREFETCH_FETCH_SEMAPHORE)
 
 
+# prefetch-summary-v1
+# fetched-лог на каждый сегмент — шумно (10+ строк/мин на активный канал).
+# Вместо этого:
+#   - первый успешный fetch на канал — INFO (подтверждение, что prefetch
+#     вообще работает);
+#   - дальше — DEBUG (видно только при IPTV_LOG_LEVEL=debug);
+#   - раз в _SUMMARY_INTERVAL_SEC — INFO-строка с агрегатом.
+_SUMMARY_INTERVAL_SEC = 300  # 5 минут
+
+# {channel_name: True} — первый fetch уже залогирован в этом процессе.
+_first_fetch_logged = set()
+_first_fetch_logged_lock = threading.Lock()
+
+# Счётчики за период summary.
+_sum_segments = 0
+_sum_bytes = 0
+_sum_time_sec = 0.0
+_sum_lock = threading.Lock()
+_last_summary_ts = time.time()
+
+
 def get_cached_segment(url: str):
     """Возвращает байты из кэша или None."""
     with _SEGMENT_CACHE_LOCK:
@@ -111,6 +132,7 @@ def _fetch_segment_sync(url: str, headers: dict):
 
 
 def _do_prefetch(url: str, headers: dict, channel: str = None) -> None:
+    global _sum_segments, _sum_bytes, _sum_time_sec
     try:
         if get_cached_segment(url) is not None:
             return
@@ -120,7 +142,24 @@ def _do_prefetch(url: str, headers: dict, channel: str = None) -> None:
             put_cached_segment(url, data)
             elapsed = time.time() - t0
             tag = channel or '?'
-            logger.info(f"[PREFETCH] [{tag}] fetched {len(data)} bytes in {elapsed:.2f}s: {url[:100]}")
+
+            # prefetch-summary-v1: первый fetch на канал — INFO,
+            # дальше — DEBUG. Плюс агрегат для summary.
+            _is_first = False
+            with _first_fetch_logged_lock:
+                if tag not in _first_fetch_logged:
+                    _first_fetch_logged.add(tag)
+                    _is_first = True
+
+            if _is_first:
+                logger.info(f"[PREFETCH] [{tag}] first fetch: {len(data)} bytes in {elapsed:.2f}s")
+            else:
+                logger.debug(f"[PREFETCH] [{tag}] fetched {len(data)} bytes in {elapsed:.2f}s: {url[:100]}")
+
+            with _sum_lock:
+                _sum_segments += 1
+                _sum_bytes += len(data)
+                _sum_time_sec += elapsed
     finally:
         with _in_progress_lock:
             _in_progress.discard(url)
@@ -159,6 +198,29 @@ def schedule_prefetch(urls: list, headers: dict, channel: str = None) -> None:
                      f"already {MAX_IN_PROGRESS} in progress")
 
 
+def _maybe_log_summary() -> None:
+    """prefetch-summary-v1: раз в _SUMMARY_INTERVAL_SEC — агрегат."""
+    global _sum_segments, _sum_bytes, _sum_time_sec, _last_summary_ts
+    now = time.time()
+    if now - _last_summary_ts < _SUMMARY_INTERVAL_SEC:
+        return
+    with _sum_lock:
+        segs = _sum_segments
+        byts = _sum_bytes
+        secs = _sum_time_sec
+        _sum_segments = 0
+        _sum_bytes = 0
+        _sum_time_sec = 0.0
+        _last_summary_ts = now
+    if segs == 0:
+        return
+    avg_kbps = (byts / 1024.0 / secs) if secs > 0 else 0.0
+    logger.info(
+        f"[PREFETCH] summary (last {_SUMMARY_INTERVAL_SEC}s): "
+        f"{segs} segments, {byts / 1024.0 / 1024.0:.1f} MB, avg {avg_kbps:.0f} KB/s"
+    )
+
+
 def cleanup_expired_segments() -> None:
     """Периодическая очистка. Вызывается из background_cleanup."""
     global _current_bytes
@@ -173,3 +235,9 @@ def cleanup_expired_segments() -> None:
             expired_count += 1
     if expired_count:
         logger.debug(f"[PREFETCH] cleaned {expired_count} expired segments")
+    # prefetch-summary-v1: попутно проверяем, не пора ли вывести summary.
+    # background_cleanup вызывает нас каждые 60 сек — этого достаточно.
+    try:
+        _maybe_log_summary()
+    except Exception as e:
+        logger.warning(f"[PREFETCH] summary failed: {e}")
