@@ -7,7 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Системный Chromium + ffmpeg (из apt) + curl (для диагностики)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    chromium ffmpeg curl ca-certificates \
+    chromium ffmpeg curl ca-certificates tini \
     && apt-get autoremove -y && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
     && rm -rf /usr/share/doc /usr/share/man /usr/share/locale /usr/share/info /usr/share/fonts/truetype/noto
@@ -30,4 +30,9 @@ RUN mkdir -p /app/db /app/logs
 
 EXPOSE 8000
 
+# tini-init-v1
+# tini как PID 1: собирает осиротевших детей (Chromium, Playwright,
+# ffmpeg) и не даёт копиться зомби. Без него uvicorn/PID 1 не вызывает
+# waitpid, и дети зомбируются.
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["uvicorn", "core.main:app", "--host", "0.0.0.0", "--port", "8000"]

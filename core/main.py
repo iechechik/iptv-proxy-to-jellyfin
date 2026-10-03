@@ -1,11 +1,11 @@
-from routers import system, web, stream, stream_hls, stream_mux, channels, channels_checks, channels_resolvers, epg, jellyfin, playlists
-
 import os
 import asyncio
 import threading
+import time
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+from routers import system, web, stream, stream_hls, stream_mux, channels, channels_checks, channels_resolvers, epg, jellyfin, playlists
 import core.state as state
 from core.config import logger
 from services.healthcheck import (
@@ -106,17 +106,39 @@ def startup():
         daemon=True,
         name="epg-maintenance",
     ).start()
+    logger.info("[STARTUP] loading EPG channels from db...")
+    _t_ch_start = time.time()
     channels_from_db = epg_manager.get_channels()
+    logger.info(f"[STARTUP] EPG channels loaded in {time.time() - _t_ch_start:.1f}s")
     if channels_from_db:
         state._epg_channels = channels_from_db
         logger.info(f"[EPG] loaded {len(state._epg_channels)} channels from db")
-        if state._epg_cache:
-            changed = build_filtered_epg(force_refresh=False)
-            if changed:
-                trigger_jellyfin_guide_refresh()
-        else:
-            build_filtered_epg(force_refresh=True)
-            trigger_jellyfin_guide_refresh()
+
+        # epg-build-async-v1: сборку XML выносим в фон. На большой БД
+        # (7500+ каналов, миллионы programmes) get_filtered_xml + gzip
+        # могут занять десятки секунд. Блокировать uvicorn нельзя —
+        # старт повиснет, и все запросы, включая /manage и /m3u, не
+        # будут обслуживаться.
+        #
+        # До завершения фоновой сборки /xmltv.xml.gz отдаёт предыдущий
+        # файл (или 503, если файла ещё нет). После сборки, если XML
+        # изменился, дёргаем refresh guide в Jellyfin.
+        def _bg_build_epg(force: bool):
+            try:
+                changed = build_filtered_epg(force_refresh=force)
+                if changed:
+                    trigger_jellyfin_guide_refresh()
+                logger.info(f"[EPG] background build complete (force={force})")
+            except Exception as e:
+                logger.error(f"[EPG] background build failed: {e}")
+
+        _force = not bool(state._epg_cache)
+        threading.Thread(
+            target=_bg_build_epg,
+            args=(_force,),
+            daemon=True,
+            name="epg-build-startup",
+        ).start()
     else:
         logger.info("[EPG] db empty, starting background full fetch")
         threading.Thread(target=update_all_sources, daemon=True).start()

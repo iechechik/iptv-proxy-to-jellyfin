@@ -61,6 +61,22 @@ class EPGManager:
                 except sqlite3.OperationalError:
                     pass  # колонка уже есть
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_programmes_source_channel ON programmes(source, channel_id)")
+                # epg-index-channel-v1: отдельный индекс на channel_id.
+                # get_filtered_xml делает "WHERE channel_id IN (?, ?, ...)" —
+                # существующий idx_programmes_source_channel не подходит
+                # (первый столбец source). Без этого индекса SQLite сканирует
+                # всю programmes (десятки миллионов строк), сборка XML повисает
+                # на минуты при старте.
+                _idx_exists = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_programmes_channel'"
+                ).fetchone()
+                if not _idx_exists:
+                    logger.info("[EPG] building index idx_programmes_channel on programmes(channel_id) — may take minutes on large DB...")
+                    _t0 = time.time()
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_programmes_channel ON programmes(channel_id)")
+                    logger.info(f"[EPG] index idx_programmes_channel ready in {time.time() - _t0:.1f}s")
+                else:
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_programmes_channel ON programmes(channel_id)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_programmes_start_time ON programmes(start_time)")
 
     def maintenance(self):

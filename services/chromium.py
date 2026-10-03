@@ -303,6 +303,28 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int, skip_u
                     if elapsed >= max_timeout:
                         break
                     page.wait_for_timeout(500)
+
+                # sniffer-waitbody-v1: под нагрузкой (несколько параллельных
+                # Chromium) response.body() не успевает прочитать тела манифестов
+                # до этого момента. Кандидаты есть, но is_master/is_media у них
+                # ещё не проставлены — тело не дочитано. Даём дополнительное
+                # окно: пока есть unclassified m3u8-кандидаты, ждём до
+                # WAIT_BODY_SEC. Это лечит ложные "no usable m3u8/embed found"
+                # на живых каналах (Al Jazeera, NBC) при healthcheck-all.
+                WAIT_BODY_SEC = 5
+                wait_body_start = time.time()
+                while True:
+                    unclassified = [
+                        c for c in candidates
+                        if c.get("type") == "m3u8"
+                        and not c.get("is_master") and not c.get("is_media")
+                    ]
+                    if not unclassified:
+                        break
+                    if time.time() - wait_body_start >= WAIT_BODY_SEC:
+                        break
+                    page.wait_for_timeout(500)
+
                 for c in candidates:
                     if c.get("type") == "m3u8":
                         v = _extract_video_id(c.get("url", ""))
@@ -355,6 +377,12 @@ def resolve_via_browser_sniffer(target_url: str, ua: str = None, max_timeout: in
             )
             res = future.result()
         if not res:
+            # sniffer-retry-v1: не выходим сразу — второй attempt часто
+            # проходит (сайт успевает ответить, Chromium стартует чище).
+            if attempt == 0:
+                logger.info(f"[SNIFFER] attempt 1 returned nothing, retry: {target_url}")
+                continue
+            logger.warning(f"[SNIFFER] both attempts returned nothing: {target_url}")
             return None
         if res.get("type") != "m3u8":
             return res

@@ -22,7 +22,10 @@ def on_epg_updated(success: bool = True, message: str = "EPG успешно об
         # базах), потом — короткий swap под lock. Раньше lock держался
         # ровно на время запроса, что блокировало healthcheck, stream
         # и всё, что ходит в cache_lock, на десятки секунд.
+        logger.info("[EPG] refreshing in-memory channels...")
+        _t_ch = time.time()
         new_epg_channels = epg_manager.get_channels()
+        logger.info(f"[EPG] in-memory channels refreshed in {time.time() - _t_ch:.1f}s (count={len(new_epg_channels)})")
         with state.cache_lock:
             state._epg_channels = new_epg_channels
         changed = build_filtered_epg(force_refresh=False)
@@ -61,8 +64,10 @@ def download_and_import_source(source: dict):
         os.replace(part_file, tmp_file)
 
         send_epg_progress(-1, f"Импорт источника {name}...")
+        logger.info(f"[EPG] source '{name}': importing...")
+        _t_imp = time.time()
         epg_manager.import_source(name, tmp_file, filters=source.get("filter"))
-        logger.info(f"[EPG] source '{name}': updated")
+        logger.info(f"[EPG] source '{name}': imported in {time.time() - _t_imp:.1f}s")
     except Exception as e:
         logger.error(f"[EPG] source '{name}': update failed: {e}")
         raise
@@ -83,14 +88,21 @@ def update_all_sources():
     if not _epg_update_lock.acquire(blocking=False):
         logger.info("[EPG] update already in progress, skipping")
         return
+    _t_all = time.time()
+    _ok = 0
+    _fail = 0
+    logger.info(f"[EPG] update-all started: {len(cfg.IPTV_EPG_SOURCES)} source(s)")
     try:
         for src in cfg.IPTV_EPG_SOURCES:
             try:
                 download_and_import_source(src)
+                _ok += 1
             except Exception as e:
+                _fail += 1
                 logger.error(f"[EPG] source {src.get('url')} skipped due to error: {e}")
         epg_manager.set_source_priority([s.get("name", s["url"]) for s in cfg.IPTV_EPG_SOURCES])
         on_epg_updated(success=True)
+        logger.info(f"[EPG] update-all finished: {_ok} ok, {_fail} failed, total {time.time() - _t_all:.1f}s")
     finally:
         _epg_update_lock.release()
 
@@ -179,7 +191,9 @@ def build_filtered_epg(force_refresh: bool = False) -> bool:
         return False
     state._epg_building = True  # можно без блокировки, т.к. защищено _epg_lock
     try:
+        _t_build = time.time()
         wanted_ids = get_wanted_tvg_ids_from_cache()  # внутри возьмёт cache_lock
+        logger.info(f"[EPG] building filtered XML for {len(wanted_ids)} channel(s)...")
         xml_content = epg_manager.get_filtered_xml(wanted_ids)
 
         tmp_xml = cfg.IPTV_EPG_CACHE_PATH + ".xml.tmp"
@@ -205,6 +219,11 @@ def build_filtered_epg(force_refresh: bool = False) -> bool:
 
         if os.path.exists(tmp_xml):
             os.remove(tmp_xml)
+        _sz = os.path.getsize(cfg.IPTV_EPG_CACHE_PATH) if os.path.exists(cfg.IPTV_EPG_CACHE_PATH) else 0
+        logger.info(
+            f"[EPG] filtered XML built in {time.time() - _t_build:.1f}s "
+            f"(size={_sz / 1024 / 1024:.1f} MB, changed={changed})"
+        )
         return changed
     finally:
         state._epg_building = False

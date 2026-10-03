@@ -477,7 +477,7 @@ def probe_stream(payload: str, timeout: int = 10, channel: str = None) -> dict:
         cmd.append(clean_url)
         logger.info(f"[PROBE] {ch_pfx}direct ffprobe for YouTube: {clean_url[:120]}...")
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 35)  # probe-timeout-v2
             if result.returncode != 0:
                 logger.warning(f"[PROBE] {ch_pfx}ffprobe failed: {result.stderr.strip()}")
                 return {"ok": False, "detail": result.stderr.strip()[:150]}
@@ -499,7 +499,7 @@ def probe_stream(payload: str, timeout: int = 10, channel: str = None) -> dict:
     if is_media_direct:
         cmd = ["ffprobe", "-v", "error",
                "-show_entries", "stream=codec_type,codec_name", "-of", "json",
-               "-timeout", str((timeout + 5) * 1000000)]
+               "-timeout", str((timeout + 25) * 1000000)]  # probe-timeout-v2
         headers_str = ""
         if headers_dict.get("Referer"):
             headers_str += f"Referer: {headers_dict['Referer']}\r\n"
@@ -526,11 +526,11 @@ def probe_stream(payload: str, timeout: int = 10, channel: str = None) -> dict:
         proxy_url = f"{proxy_base}/hls/manifest.m3u8?" + urllib.parse.urlencode(params)
         cmd = ["ffprobe", "-v", "error",
                "-show_entries", "stream=codec_type,codec_name", "-of", "json",
-               "-timeout", str((timeout + 5) * 1000000),
+               "-timeout", str((timeout + 25) * 1000000),  # probe-timeout-v2
                proxy_url]
         logger.info(f"[PROBE] {ch_pfx}ffprobe via proxy: {proxy_url[:120]}...")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 10)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 35)  # probe-timeout-v2
         if result.returncode != 0:
             logger.warning(f"[PROBE] {ch_pfx}ffprobe failed: {result.stderr.strip()}")
             return {"ok": False, "detail": result.stderr.strip()[:150]}
