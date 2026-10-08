@@ -1,699 +1,423 @@
-**Язык / Language:** русский предпочтительнее. Английский — ниже, для справки.
-**Preferred language:** Russian. English version below, for reference.
+**Язык / Language:** русский предпочтительнее, английский — краткая сводка в конце.
+**Preferred language:** Russian; a short English summary is at the end.
 
 ---
 
-# Русский
+# IPTV-Proxy
 
 Личный проект. Без планов дальнейшего развития — публикуется как есть.
 
-FastAPI-сервис, который отдаёт Jellyfin'у IPTV-каналы в виде M3U-плейлиста
-с EPG (расписанием, собранным из публичных баз), автоматическим разрешением
-потоков и fallback'ом между стримами канала.
+FastAPI-сервис, который отдаёт Jellyfin'у IPTV-каналы в виде M3U-плейлиста с EPG
+(расписанием из публичных источников), сам разрешает ссылки на потоки, держит их
+живыми и подменяет умершие на резервные.
 
----
+```
+Jellyfin ──/m3u──▶ канал ──/redirect/{name}.m3u8──▶ резолвер ──▶ payload ──┐
+                                                                          ├─▶ HLS напрямую
+                                                                          └─▶ /mux/{name}.ts (ffmpeg, если A/V раздельные)
+```
 
 ## Что умеет
 
 - **M3U-плейлист** на `/m3u` — каждый канал ведёт на `/redirect/{name}.m3u8`.
-- **EPG** на `/xmltv.xml.gz` — собирается из указанных вами источников и
-  фильтруется по каналам из конфига.
-- **Резолверы**: прямой URL, `yt-dlp`, `streamlink`, FlareSolverr,
-  headless-Chromium («sniffer»). Порядок применения задаётся в конфиге,
-  результат кэшируется по TTL. Sniffer собирает все HLS-кандидаты
-  (master/media/ad/embed), классифицирует их по имени файла и телу
-  манифеста, отбрасывает рекламные (`_is_ad_url`, `_is_ad_manifest`) и
-  выбирает лучший.
-- **Fallback**: если активный стрим канала умер, сервис переключается на
-  следующий рабочий из списка потоков этого канала.
-- **Микширование A/V** через ffmpeg, если источник отдаёт видео и аудио
-  раздельно (`#EXT-X-MEDIA:TYPE=AUDIO`). Включается автоматически по
-  `needs_mux` или вручную через `mux_state` (см. ниже).
-- **Ручное управление муксом** — `mux_state: auto | on | off` на уровне
-  потока. Удобно, когда канал воспроизводится только через мукс
-  (например, Pluto/AES-128) или наоборот — мукс не нужен.
-- **Внешние M3U-плейлисты** — поиск каналов по публичным плейлистам
-  (GitHub и т.п.) прямо из модалки потоков. Найденный URL можно проверить
-  одной кнопкой и подставить в поток канала.
-- **Журнал событий каналов** — отдельный текстовый лог изменений
-  (конфигурация + переходы UP/DOWN). См. раздел «Журнал событий каналов».
-- **EPG prune + VACUUM** — старые программы (7+ дней) удаляются после
-  каждого успешного импорта источника; БД сжимается (`VACUUM`) раз в
-  сутки в `IPTV_EPG_UPDATE_TIME`. `meta.updated_at` переживает рестарт —
-  расписание импорта не сбрасывается.
-- **Watchdog FlareSolverr** — опциональный скрипт, рестартует зависший
-  контейнер по flag-файлу от `resolver.py`.
-- **Веб-UI** на `/manage`: список каналов, модалка с потоками, вкладки
-  EPG-источников, плейлистов и логов.
-
----
+- **EPG** на `/xmltv.xml.gz` — собирается из ваших источников, фильтруется по
+  каналам конфига, отдаётся с `ETag`/`Last-Modified` (Jellyfin получает 304 и не
+  выкачивает один и тот же файл по 46 раз).
+- **Резолверы**: `direct`, `yt-dlp`, `streamlink`, `flaresolverr_simple`,
+  `flaresolverr_session`, `sniffer` (headless Chromium). Порядок перебора
+  настраивается, результат кэшируется.
+- **Сниффер**: собирает HLS-кандидатов со страницы, классифицирует их по имени и
+  телу манифеста, выбрасывает рекламные, мёртвые (4xx) и уже истёкшие (по `exp`),
+  выбирает лучший. Если у master'а аудио вынесено отдельной группой, а сам
+  вариант аудио не несёт, сервис отдаёт не master, а собранный из **проверенных
+  пробой** листьев манифест (у части CDN повторная загрузка master'а не проходит,
+  а листья живут).
+- **Проба живости** — проверяется не «payload вообще», а то, что реально пойдёт в
+  плеер: вариант с максимальным битрейтом и (если есть) аудио-группа. Перед
+  ffprobe делается быстрый TCP-коннект, а разбор ограничен 3 с / 1.5 МБ — иначе
+  на живом «бесконечном» потоке (склейка рекламы, SSAI) ffprobe читает его до
+  таймаута и канал получает ложный DOWN.
+- **Кэш по сроку жизни ссылки** — TTL считается по самой ссылке (`exp` в URL,
+  сессионные маркеры), а не по `Cache-Control` ответа. Проверка канала
+  планируется заранее — на 0.75 от остатка жизни самой короткой ссылки канала.
+  См. «Кэш и расписание проверок».
+- **Микширование A/V** через ffmpeg, когда источник отдаёт видео и аудио
+  раздельно (`#EXT-X-MEDIA:TYPE=AUDIO`). Входы прогреваются до старта, чтобы
+  первый сеанс не остался без звука.
+- **Fallback** между потоками канала: умер активный — сервис переключается на
+  следующий рабочий и уводит канал в карантин (чёрный экран) на время
+  переразбора.
+- **Журнал событий каналов** — отдельный лог изменений конфигурации и переходов
+  UP/DOWN.
+- **mediainfo-кэш Jellyfin** чистится автоматически при смене режима доставки —
+  Jellyfin не «залипает» на старом формате.
+- **EPG prune + VACUUM** — старые программы удаляются после каждого импорта,
+  база сжимается раз в сутки.
+- **Ручное управление муксом** (`mux_state: auto | on | off`) на уровне потока.
+- **Внешние M3U-плейлисты** — поиск URL по публичным плейлистам прямо из модалки
+  канала.
+- **Watchdog FlareSolverr** — опциональный скрипт, рестартует зависший контейнер
+  по flag-файлу от сервиса.
+- **Веб-UI** на `/manage`: каналы, потоки, EPG-источники, плейлисты, логи.
 
 ## Требования
 
 - Docker и docker compose
-- Jellyfin (или совместимый клиент, умеющий M3U + XMLTV)
-- FlareSolverr — только если планируете использовать резолверы через него
-
----
+- Jellyfin (или совместимый клиент с M3U + XMLTV)
+- FlareSolverr — только если используете резолверы через него
 
 ## Быстрый старт
 
-Все нужные файлы лежат в корне проекта.
-
-**1. Создайте рабочий каталог `data/` и скопируйте в него примеры:**
+**1. Рабочий каталог и примеры:**
 
 ```bash
 mkdir -p data
 cp config.example.json   data/config.json
-cp override.example.json data/override.json      # опционально
+cp override.example.json data/override.json     # опционально
 cp docker-compose.example.yml docker-compose.yml
-2. Впишите API-ключ Jellyfin в docker-compose.yaml:
+```
 
-text
-IPTV_JELLYFIN_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-Ключ создаётся в Jellyfin: Панель управления → API-ключи → Добавить.
-Без ключа EPG обновляется по штатному расписанию Jellyfin, автотриггер
-refresh guide работать не будет.
+**2. Впишите API-ключ Jellyfin** в `docker-compose.yml`:
 
-3. Отредактируйте data/config.json — свои каналы и EPG-источники.
+```yaml
+environment:
+  IPTV_JELLYFIN_API_KEY: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+```
 
-4. Соберите и запустите:
+Ключ создаётся в Jellyfin: Панель управления → API-ключи → Добавить. Без ключа
+EPG обновляется по штатному расписанию Jellyfin, автотриггер «обновить
+расписание» работать не будет.
 
-bash
+**3. Отредактируйте `data/config.json`** — свои каналы и источники EPG.
+
+**4. Сборка и запуск:**
+
+```bash
 docker compose build iptv-proxy
 docker compose up -d
-5. Откройте веб-UI:
+```
 
-text
-http://<хост>:9098/manage
-6. Подключите к Jellyfin (Live TV):
+**5. Веб-UI:** `http://<хост>:9098/manage`
 
-Что	URL
-TV-источники (M3U)	http://iptv-proxy:8000/m3u
-Источники телепрограмм (XMLTV)	http://iptv-proxy:8000/xmltv.xml.gz
-Если Jellyfin ходит к IPTV-Proxy не через docker-сеть, замените имя
-iptv-proxy на адрес хоста, доступный из контейнера Jellyfin.
+**6. Подключение в Jellyfin (Live TV):**
 
-Переменные окружения
-Переменная	Описание	По умолчанию
-IPTV_JELLYFIN_API_KEY	API-ключ Jellyfin. Нужен для автотриггера refresh guide.	—
-IPTV_JELLYFIN_URL	URL Jellyfin внутри docker-сети.	http://jellyfin:8096
-IPTV_MANAGE_URL	URL самого сервиса. Используется во внутренних ссылках.	http://iptv-proxy:8000
-IPTV_CONFIG_FILE	Путь к основному конфигу внутри контейнера.	/app/config.json
-IPTV_LOG_LEVEL	debug / info / warning / error.	info
-Остальные тюнинги (TTL кэша, лимиты резолверов, idle-таймаут мукса,
-интервалы healthcheck'а и т.п.) описаны в config.example.json.
-Их можно менять прямо там или через override.json — второй мёржится
-поверх первого при старте.
+| Что | URL |
+| --- | --- |
+| TV-источники (M3U) | `http://iptv-proxy:8000/m3u` |
+| Источники телепрограмм (XMLTV) | `http://iptv-proxy:8000/xmltv.xml.gz` |
 
-Структура config.json
-Секция	Назначение
-epg	Источники EPG: URL, интервал обновления, фильтр по id/именам, update_time = время VACUUM
-playlist_sources	Внешние M3U-плейлисты для поиска каналов
-server	manage_url, имя файла override
-jellyfin	URL Jellyfin, путь до его xmltv-кэша, таймаут API
-resolver	Дефолтный User-Agent, порядок резолверов, таймауты
-cache	TTL кэша для разных типов резолва
-mux	Параметры ffmpeg-микшера
-healthcheck	Планировщик проактивных проверок каналов
-fallback	Переключение на резервный стрим
-limits	Семафоры на параллельные резолвы
-logging	Уровень, размер буфера, ротация
-analytics	Сборщик статистики URL (по умолчанию выключен)
-channels	Список каналов
-EPG: prune старых программ и VACUUM
-В programmes пишется start_time (unixtime) — парсится из XMLTV start.
-Это позволяет удалять старые программы без парсинга XML.
+Если Jellyfin ходит к IPTV-Proxy не через docker-сеть, замените имя `iptv-proxy`
+на адрес хоста, доступный из контейнера Jellyfin.
 
-Логика:
+## Переменные окружения
 
-Prune — после каждого успешного import_source. Удаляет
-программы старше 7 дней. Записи без start_time (старые, до миграции)
-сохраняются до следующего переимпорта — после переимпорта у них появится
-start_time.
+| Переменная | Описание | По умолчанию |
+| --- | --- | --- |
+| `IPTV_JELLYFIN_API_KEY` | API-ключ Jellyfin. Нужен для автотриггера «обновить расписание». | — |
+| `IPTV_JELLYFIN_URL` | URL Jellyfin внутри docker-сети. | `http://jellyfin:8096` |
+| `IPTV_MANAGE_URL` | URL самого сервиса (используется во внутренних ссылках). | `http://iptv-proxy:8000` |
+| `IPTV_CONFIG_FILE` | Путь к основному конфигу внутри контейнера. | `/app/config.json` |
+| `IPTV_LOG_LEVEL` | `debug` / `info` / `warning` / `error`. | `info` |
+| `IPTV_EPG_UPDATE_TIME` | Время суточного VACUUM базы EPG. | `02:35` |
+| `IPTV_CHANNEL_EVENTS_LOG` | Путь к журналу событий каналов. | `/app/logs/channel_events.log` |
+| `IPTV_JELLYFIN_MEDIAINFO_DIR` | Каталог mediainfo-кэша Jellyfin внутри контейнера. | `/jellyfin-mediainfo-cache` |
 
-VACUUM — раз в сутки, в IPTV_EPG_UPDATE_TIME (по умолчанию 02:35).
-Сжимает БД (PRAGMA wal_checkpoint(TRUNCATE) + VACUUM).
-У programmes после удаления остаётся freelist — VACUUM возвращает место ОС.
+Остальные параметры (TTL, лимиты резолверов, idle-таймаут мукса, интервалы
+healthcheck'а) живут в `config.json` → полная схема со всеми ключами и
+комментариями лежит в `config.example.json`. Временные переопределения удобно
+держать в `override.json` (см. `override.example.json`): он мёржится поверх
+основного конфига при старте и не перезаписывается из UI.
 
-Расписание импорта источников — по interval каждого источника
-(iptvx: 12ч, us_guide_nbc: 24ч). last_update читается из
-meta.updated_at при старте — рестарт контейнера не сбрасывает таймер.
-Пустая БД → last_update = 0 → импорт при первом же цикле.
+## Структура config.json
 
-IPTV_EPG_UPDATE_TIME больше не «ночное обновление всех источников»
-(это было дважды: ночной апдейт всех + интервалы — источники могли
-импортироваться два раза). Теперь это только время VACUUM.
+| Секция | Назначение |
+| --- | --- |
+| `epg` | Источники расписания: URL, интервал, фильтр, `update_time` = время VACUUM |
+| `playlist_sources` | Внешние M3U-плейлисты для поиска URL |
+| `server` | `manage_url`, имя файла override |
+| `jellyfin` | URL Jellyfin, каталог его xmltv-кэша, каталог mediainfo-кэша, таймаут API |
+| `resolver` | User-Agent по умолчанию, порядок резолверов, таймауты |
+| `cache` | Верхние пределы TTL, пауза после неудачного резолва |
+| `mux` | Параметры ffmpeg-микшера |
+| `healthcheck` | Планировщик проактивных проверок каналов |
+| `fallback` | Переключение на резервный поток |
+| `limits` | Семафоры параллельных операций |
+| `logging` | Уровень, буфер, ротация, путь журнала событий |
+| `analytics` | Сборщик статистики URL (по умолчанию выключен) |
+| `channels` | Список каналов |
 
-Формат канала
-json
+## Кэш и расписание проверок
+
+Кэшируется не «ответ CDN», а **ссылка**, и TTL считается по её сроку жизни:
+
+| Случай | TTL |
+| --- | --- |
+| В URL есть `exp`/`expires`/`expire_at` (в том числе Akamai `~exp=`) | `exp` минус 75 секунд |
+| Сессионный URL (`wmsauthsign`, `PHPSESSID`, `token=`, `.php` и т.п.) | 300 секунд |
+| Всё остальное | верхний предел метода: `cache_ttl` (3600) или `fast_cache_ttl` (900) |
+
+`Cache-Control` для TTL **не используется**: живые HLS-плейлисты почти всегда
+отдаются с `no-store`/`max-age=1` (плейлист меняется каждые несколько секунд),
+хотя сама ссылка живёт часами. Если брать эти заголовки за срок жизни, рабочий
+payload выбрасывается каждые 30 секунд, канал уходит в бесконечный перерезолв и
+падает от любой заминки.
+
+Дальше включаются страховки:
+
+- **проба перед записью** — в кэш не попадает ссылка, которая уже не играет;
+- **измеренный срок жизни** — если ссылка канала умирала раньше верхнего
+  предела, интервал проверок сжимается до `0.7 ×` минимума последних наблюдений
+  (пол — 60 секунд);
+- **stale-gate** — мукс, получивший 403/404 от CDN, помечает payload мёртвым и
+  заказывает переразбор, не дожидаясь плановой проверки.
+
+Плановая проверка канала ставится на `0.75 ×` остатка жизни **самой короткой**
+ссылки канала: обновляем заранее, а не в момент смерти. Нижняя граница —
+`healthcheck.scheduler_min_interval`, но она никогда не ставится больше срока
+жизни ссылки, иначе payload гарантированно протухает между проверками. Канал,
+который только что смотрели (`healthcheck.recently_active_sec`), планировщик не
+трогает — его проверяет путь по запросу клиента.
+
+Свой вердикт планировщик пишет в лог:
+
+```
+[HEALTHCHECK] 'Канал': следующий разбор через 446 с (остаток ссылки 595 с, success=True)
+```
+
+## Микширование A/V (мукс)
+
+Мукс нужен, когда источник отдаёт видео и аудио раздельными дорожками. Режим
+задаётся полем потока `mux_state`:
+
+| Значение | Что делает |
+| --- | --- |
+| `auto` (по умолчанию) | Мукс включается, если в master-плейлисте есть `#EXT-X-MEDIA:TYPE=AUDIO`. Вердикт кэшируется в `streams_cache[i].needs_mux`. |
+| `on` | Принудительно через мукс. Нужно для источников, которые Jellyfin не читает напрямую (SSAI-склейки, AES-128 и т.п.). |
+| `off` | Принудительно без мукса. Для каналов с раздельными A/V это даст воспроизведение без звука — Jellyfin сам дорожки не миксует. |
+
+Приоритет: `mux_state` активного потока > `needs_mux` из кэша.
+
+Что сервис делает при старте мукса:
+
+1. **Прогревает входы** — тянет плейлисты, пока в них не появятся сегменты.
+   Иначе холодный аудио-лист на старте даёт сеанс без звука, который «лечится»
+   только перезапуском канала.
+2. **Решает, сколько входов** — если выбранный вариант master'а сам несёт и
+   видео, и аудио, он идёт **одним** входом: поток начинается с границы сегмента
+   (с ключевого кадра), и Jellyfin корректно определяет параметры видео. При двух
+   входах картинка может начаться не с ключевого кадра — тогда клиент видит
+   «параметры видео неизвестны» и играет только звуком.
+3. **Следит за смертью входа** — три подряд 4xx от CDN → payload помечается
+   мёртвым, мукс гасится, канал уходит на переразбор.
+
+Ставится из UI: канал → модалка → «Управление потоками» → селект `mux`.
+При смене `mux_state`, `active_stream_index`, `url` или `resolver` активного
+потока сервис сам удаляет mediainfo-кэш Jellyfin для канала — перезапускать
+Jellyfin не нужно.
+
+## Fallback и карантин
+
+Если активный поток канала перестал играть, сервис переключается на следующий
+рабочий поток того же канала (порядок — как в конфиге). Параметры поведения —
+в секции `fallback` (`cooldown`, `switch_min_sec_active`, `switch_speedup_sec`).
+
+Пока канал в карантине (не разрезолвился, пауза `cache.failed_resolve_ttl`),
+вместо ошибки отдаётся чёрный манифест (`/black.ts`) — плеер не сыпет ошибками и
+не крутит бесконечную загрузку.
+
+## EPG
+
+Источники расписания — секция `epg.sources`. Каждый источник обновляется по
+своему `interval` (`12h`, `30m`, `2d` или секунды); `disable: true` выключает
+автообновление, но источник можно дёрнуть руками из UI.
+
+Фильтр на источник:
+
+```json
+"filter": { "mode": "whitelist", "match": "any", "ids": ["channel-id"], "names": ["Channel Name"] }
+```
+
+`mode`: `all` | `whitelist` | `blacklist`; `match`: `any` | `all`.
+
+Обслуживание базы:
+
+- **prune** — после каждого успешного импорта удаляются программы старше 7 дней
+  (в таблице хранится `start_time` в unixtime, поэтому XML не парсится);
+- **VACUUM** — раз в сутки в `epg.update_time` (`PRAGMA wal_checkpoint(TRUNCATE)`
+  + `VACUUM`);
+- расписание импорта переживает рестарт: `meta.updated_at` читается из базы при
+  старте.
+
+Готовый XMLTV отдаётся на `/xmltv.xml.gz` вместе с `ETag` (`<файл>.md5`) и
+`Last-Modified`; при совпадении Jellyfin получает `304` без тела.
+
+## Формат канала
+
+```json
 {
     "name": "ChannelName",
     "chno": "1",
     "group": "News",
     "tvgid": "channel-id-in-epg",
     "real_name": "Channel Name as in EPG",
+    "fallback": true,
+    "active_stream_index": 0,
     "streams": [
         {
             "url": "https://site.example/watch",
             "resolver": "auto",
             "ua": "Mozilla/5.0 ...",
             "mux_state": "auto",
-            "stream_id": 3918603096042605
+            "stream_id": 3918603096042605,
+            "prefetch": true
         }
-    ],
-    "fallback": true
+    ]
 }
-Поле resolver — одно из:
+```
 
-text
-auto | direct | yt-dlp | streamlink
-flaresolverr_simple | flaresolverr_session | sniffer
-auto перебирает резолверы по порядку из секции resolver.order, пока
-один не сработает. Конкретное имя заставляет использовать только его.
+- `resolver`: `auto` | `direct` | `yt-dlp` | `streamlink` |
+  `flaresolverr_simple` | `flaresolverr_session` | `sniffer`. `auto` перебирает
+  резолверы в порядке `resolver.order`, пока один не сработает; конкретное имя
+  заставляет использовать только его.
+- `stream_id` — внутренний идентификатор потока (52-битное число). Назначается
+  автоматически, нужен, чтобы слоты `streams_cache` не теряли привязку при
+  переупорядочивании потоков. Руками трогать не надо.
+- `prefetch` — предзагрузить первый сегмент до запроса клиента.
+- `disable: true` — поток (или канал) не используется, но остаётся в конфиге.
+- `comment` — свободный текст, сохраняется как есть.
 
-Поле stream_id — внутренний идентификатор потока (52-битное число).
-Назначается автоматически при добавлении/сохранении. Нужен, чтобы слоты
-streams_cache не теряли привязку при переупорядочивании потоков. Руками
-трогать не надо.
+## Журнал событий каналов
 
-Ручное управление муксом (mux_state)
-Флаг mux_state живёт на уровне потока (streams[i].mux_state).
-Возможные значения:
+Отдельный текстовый лог: `logs/channel_events.log`. Читается через `tail -f`:
 
-Значение	Что делает
-auto (по умолчанию)	Как раньше: мукс включается, если в master-плейлисте есть #EXT-X-MEDIA:TYPE=AUDIO (раздельные A/V). Считается один раз, кэшируется в streams_cache[i].needs_mux.
-on	Принудительно через мукс. Удобно для источников, где Jellyfin не читает HLS напрямую: Pluto (AES-128 + ffmpeg 7+ regression), SSAI-потоки и т.п.
-off	Принудительно без мукс. Удобно, когда мукс не нужен и хочется сэкономить CPU. Для двухвходовых каналов (с #EXT-X-MEDIA:TYPE=AUDIO) это приведёт к воспроизведению без звука — Jellyfin сам не миксует.
-Приоритет: mux_state из активного stream > needs_mux из кэша.
-
-Ставится из UI: канал → модалка → 🎬 Управление потоками → селект mux:
-рядом с Prefetch. Или напрямую в config.json.
-
-Замечание про on: работает для любого потока, где Jellyfin-ffmpeg
-успешно читает raw TS от мукса. При смене mux_state (auto ↔ on ↔ off),
-active_stream_index, url или resolver активного потока iptv-proxy
-автоматически удаляет mediainfo-кэш Jellyfin для этого канала, поэтому
-перезагрузка Jellyfin не нужна и «залипания» старого режима не происходит
-(см. раздел «mediainfo-кэш Jellyfin» ниже).
-
-Замечание про off: если канал имеет #EXT-X-MEDIA:TYPE=AUDIO
-(раздельные дорожки), Jellyfin не сможет их смикшировать сам —
-будет без звука или упадёт. Для таких каналов — auto или on.
-
-Журнал событий каналов
-Отдельный текстовый лог с историей изменений: logs/channel_events.log.
-Формат построчный, читается через tail -f:
-
-text
+```
 2026-10-02 18:15:23 [НТВ] cfg: stream#1 (ivi.ru/...) mux_state: auto -> on (ui)
 2026-10-02 18:16:01 [SkyNews] state: UP -> DOWN (healthcheck)
 2026-10-02 18:17:44 [Euronews] state: DOWN -> UP (ui)
-Префикс cfg: — конфигурационные изменения (пользователь через UI
-или авто-подбор EPG). Префикс state: — переходы состояния канала
-(UP/DOWN, автоматические переключения активного потока).
-В скобках в конце — источник: ui, healthcheck, fallback,
-startup, auto_match.
+```
 
-Ротация — те же параметры, что у основных логов
-(IPTV_LOG_MAX_BYTES, IPTV_LOG_BACKUP_COUNT).
+- префикс `cfg:` — изменения конфигурации (UI, авто-подбор EPG);
+- префикс `state:` — переходы состояния канала (UP/DOWN, смена активного потока);
+- в скобках — источник: `ui`, `healthcheck`, `fallback`, `startup`, `auto_match`.
 
-Путь к файлу: IPTV_CHANNEL_EVENTS_LOG (env) или
-config.json → logging.channel_events_log. По умолчанию —
-/app/logs/channel_events.log.
+Ротация — как у основных логов (`logging.max_bytes`, `logging.backup_count`).
 
-mediainfo-кэш Jellyfin
-Jellyfin при первом probe канала сохраняет в cache/mediainfo/*.json
-информацию о контейнере (Container: hls или Container: ts).
-При последующих открытиях канала он не делает probe заново, а
-использует закэшированный формат.
+## mediainfo-кэш Jellyfin
 
-Если канал сменил режим доставки (HLS ↔ raw TS через мукс) — старый
-кэш ломает воспроизведение (Jellyfin-ffmpeg падает с exit 183
-«Invalid data found when processing input»).
+Jellyfin при первом probe канала запоминает формат контейнера
+(`Container: hls` или `Container: ts`) в `cache/mediainfo/*.json` и потом
+переиспользует его. Если канал сменил режим доставки (HLS ↔ raw TS через мукс),
+старый кэш ломает воспроизведение (Jellyfin-ffmpeg падает с
+`Invalid data found when processing input`).
 
-Решение: iptv-proxy автоматически удаляет mediainfo-кэш Jellyfin
-для канала при изменении:
+Сервис сам удаляет файл канала, когда меняется `mux_state`, `active_stream_index`,
+`url` или `resolver` активного потока — при следующем открытии Jellyfin делает
+свежий probe. Нужно только смонтировать каталог:
 
-mux_state активного потока (auto ↔ on ↔ off),
+```yaml
+volumes:
+  - ./jellyfin-config/cache/mediainfo:/jellyfin-mediainfo-cache
+```
 
-active_stream_index,
+Путь настраивается через `IPTV_JELLYFIN_MEDIAINFO_DIR` или
+`config.json → jellyfin.mediainfo_cache_dir`.
 
-url активного потока,
+## Внешние M3U-плейлисты
 
-resolver активного потока.
+`playlist_sources` подключает публичные M3U (GitHub, кураторские списки) как
+**справочник**: найти URL, проверить, подставить в поток. Автоимпорта каналов нет.
 
-При следующем открытии канала Jellyfin делает свежий probe и
-корректно определяет формат. Перезагрузка Jellyfin не нужна.
-
-Требуется монтирование в docker-compose.yaml:
-
-yaml
-- /opt/docker-compose/configs/jellyfin/cache/mediainfo:/jellyfin-mediainfo-cache
-Путь настраивается через IPTV_JELLYFIN_MEDIAINFO_DIR (env) или
-config.json → jellyfin.mediainfo_cache_dir.
-
-Внешние M3U-плейлисты
-Раздел playlist_sources позволяет подключить публичные M3U-плейлисты
-(GitHub, кураторские списки и т.п.) и искать в них URL для потоков
-каналов. Это не импорт каналов в config.json, а справочник: ищешь,
-проверяешь, подставляешь.
-
-json
+```json
 "playlist_sources": [
-    {
-        "name": "smolnp_main",
-        "url": "https://raw.githubusercontent.com/smolnp/IPTVru/refs/heads/gh-pages/IPTVru.m3u",
-        "interval": 86400,
-        "disable": true
-    }
+    { "name": "example", "url": "https://.../tv.m3u", "interval": 86400, "disable": true }
 ]
-Поля:
+```
 
-Поле	Назначение
-name	Уникальное имя источника
-url	URL M3U-плейлиста
-interval	Интервал обновления в секундах (фон, раз в минуту проверяется)
-disable	true — не обновлять автоматически (можно дёрнуть вручную из UI)
-Как пользоваться:
+Как пользоваться: вкладка «Плейлисты» в UI → добавить/обновить источник; в модалке
+канала → «Управление потоками» → 🔍 рядом с полем URL → поиск по имени канала →
+тап по результату делает HEAD-проверку за секунду; живой URL подставляется в
+поле, мёртвый показывает HTTP-код и поле не трогает.
 
-Вкладка «Плейлисты» в веб-UI — управление источниками: добавить,
-редактировать, обновить один, обновить все, очистить данные.
+Из плейлиста берётся только URL (и заголовки из `#EXTVLCOPT`, если есть —
+`http-referrer`, `http-user-agent`), они попадают в payload как
+`url|Referer=...|User-Agent=...`. Логотипы, группы и `tvg-id` игнорируются: EPG
+выбирается отдельно, в модалке канала.
 
-В модалке канала → «Управление потоками» → кнопка 🔍 рядом
-с полем URL. Откроется поиск по плейлистам.
+## Эндпоинты
 
-Набери имя канала (минимум 2 буквы). Результаты — по всем активным
-источникам.
+| Путь | Назначение |
+| --- | --- |
+| `/m3u` | M3U-плейлист для Jellyfin |
+| `/xmltv.xml.gz` | EPG (XMLTV, gzip) с `ETag`/304 |
+| `/redirect/{name}.m3u8` | Точка входа для каждого канала (`.ts` — то же самое) |
+| `/mux/{name}.ts` | Микшированный A/V-поток (raw MPEG-TS) |
+| `/synthetic/{name}.m3u8` | Сохранённый синтетический манифест канала |
+| `/hls/{name}.{ext}` | Универсальный прокси HLS: `ext` = `m3u8` / `ts` / `key` / `vtt` / `m4s` / `mp4` (расширение обязательно) |
+| `/hls/manifest.m3u8`, `/hls/segment.ts` | Совместимые старые роуты |
+| `/black.ts` | Чёрный TS (заглушка для карантина) |
+| `/manage` | Веб-UI |
+| `/logs`, `/logs/data`, `/logs/clear` | Логи: просмотр, данные, очистка |
+| `/status` | Краткий статус сервиса |
+| `/events` | SSE-поток обновлений для UI |
+| `/config/restart` | Перезапуск контейнера (POST) |
+| `/channels/get`, `/channels/add`, `/channels/delete` | Каналы: чтение, добавление, удаление |
+| `/channels/toggle`, `/channels/toggle-fallback` | Вкл/выкл канала, fallback |
+| `/channels/update-stream` | Сохранение потоков канала (чистит mediainfo-кэш) |
+| `/channels/clear-cache` | Очистка кэша канала (одного или всех) |
+| `/channels/check-single`, `/channels/check-all/start`, `/channels/check-all/status/{task_id}` | Проверки каналов |
+| `/channels/probe`, `/channels/check-mux` | Проба потока, проверка мукса |
+| `/channels/apply-resolvers`, `/channels/reset-resolvers` | Пин/сброс резолверов |
+| `/epg/save`, `/epg/sources`, `/epg/status`, `/epg/channels` | EPG: сохранение, источники, статус, каналы |
+| `/epg/rebuild`, `/epg/auto-match`, `/epg/update-source/{name}`, `/epg/update-all` | Пересборка, авто-подбор tvg-id, обновление источников |
+| `/playlists/sources`, `/playlists/refresh/{name}`, `/playlists/refresh-all`, `/playlists/clear/{name}`, `/playlists/search`, `/playlists/check` | Внешние M3U-плейлисты |
+| `/webhooks/jellyfin` | Вебхук Jellyfin (события воспроизведения) |
 
-Тап на результат → HEAD-проверка URL за 1 секунду.
+## Watchdog FlareSolverr
 
-URL живой — подставляется в поле потока.
+`restart_flaresolverr.sh` — опциональный скрипт на случай, когда FlareSolverr
+иногда зависает. Сервис при ошибке FlareSolverr кладёт flag-файл
+(`healthcheck.flaresolverr_flag_file`), скрипт по таймеру (например,
+systemd-юнитом раз в минуту) видит флаг, рестартует контейнер и снимает флаг.
+Есть кулдаун, чтобы не уйти в цикл рестартов. Внутри скрипта есть путь к каталогу
+с конфигом — поменяйте под свой сетап; пример systemd-юнита — в шапке скрипта.
 
-Мёртвый — сообщение с HTTP-кодом, поле не трогается.
+## Обратная связь
 
-Особенности:
-
-Не матчит EPG. tvg-id из плейлиста игнорируется. Смысл — взять
-URL. EPG выбирается отдельно, в правой колонке модалки канала.
-
-Проверка по тапу — только HEAD, 1 секунда. Не ffprobe. Если нужно
-точнее — после подстановки URL есть обычные кнопки «Проверить поток»
-и «Проверить ffprobe».
-
-Никаких автоимпортов. Каналы добавляются вручную, через обычные
-модалки. Плейлисты только помогают найти URL.
-
-#EXTVLCOPT парсится. Если в плейлисте есть http-referrer или
-http-user-agent — они попадут в payload (url|Referer=...|User-Agent=...).
-
-Логотипы, группы, tvg-id игнорируются. Из плейлиста берётся
-только URL (+ опционально заголовки из #EXTVLCOPT).
-
-disable: true в примере — намеренно. При старте ничего не
-скачивается. Ты сам включаешь нужные источники и жмёшь «Обновить».
-
-Эндпоинты
-Путь	Назначение
-/m3u	M3U-плейлист для Jellyfin
-/xmltv.xml.gz	EPG в формате XMLTV (gzip)
-/redirect/{name}.m3u8	Точка входа для каждого канала
-/hls/{name}.{ext}	Универсальный прокси HLS: ext = m3u8 / ts / key / vtt / m4s / mp4. Расширение в пути обязательно, иначе Jellyfin-ffmpeg 8+ отказывается открывать.
-/hls/manifest.m3u8	Совместимый старый роут (HLS-манифест)
-/hls/segment.ts	Совместимый старый роут (сегмент)
-/mux/{name}.ts	Микшированный A/V-поток (raw MPEG-TS)
-/manage	Веб-UI
-/logs	Просмотр логов
-/status	Краткий статус сервиса
-/events	SSE-поток обновлений для UI
-/playlists/sources	GET/POST — список и сохранение источников M3U-плейлистов
-/playlists/refresh/{name}	Обновить один источник (фоново)
-/playlists/refresh-all	Обновить все активные источники
-/playlists/clear/{name}	Очистить данные источника в SQLite
-/playlists/search?q=...	Поиск по кэшу плейлистов
-/playlists/check	HEAD-проверка URL (используется UI при тапе)
-Watchdog FlareSolverr
-restart_flaresolverr.sh — опциональный скрипт для случая, когда
-FlareSolverr иногда зависает.
-
-Как работает: resolver.py при ошибке FlareSolverr кладёт flag-файл
-flags/flaresolverr_restart.request. Скрипт по таймеру (например,
-systemd-юнитом раз в минуту) видит флаг, рестартует контейнер и снимает
-флаг. Есть кулдаун, чтобы не уйти в цикл рестартов.
-
-Внутри скрипта есть путь к каталогу с конфигом — поменяйте под свой сетап.
-Пример systemd-юнита смотрите в шапке скрипта.
-
-Обратная связь
 Issues читаю. Отвечать не обещаю.
 
-Лицензия
-Unlicense — public domain. Делайте что хотите, без обязательств.
-Полный текст: LICENSE.
-
-English
-A personal project. No plans for further development — published as-is.
-
-FastAPI service that serves IPTV channels to Jellyfin as an M3U playlist
-with EPG (schedule pulled from public sources), automatic stream
-resolution, and per-channel fallback between streams.
-
-Features
-M3U playlist at /m3u — each channel points to /redirect/{name}.m3u8.
-
-EPG at /xmltv.xml.gz — assembled from configured sources and
-filtered by the channels in your config.
-
-Resolvers: direct URL, yt-dlp, streamlink, FlareSolverr,
-headless Chromium ("sniffer"). The order is configurable; results are
-cached with per-method TTL. Sniffer collects all HLS candidates
-(master/media/ad/embed), classifies them by file name and manifest
-body, drops ad ones (_is_ad_url, _is_ad_manifest), and picks the
-best.
-
-Fallback: if the active stream of a channel dies, the service
-switches to the next working stream in that channel's list.
-
-A/V muxing via ffmpeg when a source provides video and audio
-separately (#EXT-X-MEDIA:TYPE=AUDIO). Auto (needs_mux) or manual
-via mux_state (see below).
-
-Manual mux control — mux_state: auto | on | off per stream. Useful
-when a channel only works through mux (Pluto/AES-128) or vice versa.
-
-External M3U playlists — search channels across public playlists
-(GitHub and similar) from the streams modal. A found URL can be checked
-with one click and inserted into the channel stream.
-
-Channel events log — separate text log of changes (configuration
-
-UP/DOWN transitions). See "Channel events log" section.
-
-EPG prune + VACUUM — programmes older than 7 days are removed after
-each successful source import; the DB is compacted (VACUUM) once a
-day at IPTV_EPG_UPDATE_TIME. meta.updated_at survives restarts,
-so the import schedule is not reset.
-
-FlareSolverr watchdog — optional script that restarts a stuck
-container when resolver.py drops a flag file.
-
-Web UI at /manage: channel list, streams modal, EPG sources tab,
-playlists tab, log tab.
-
-Requirements
-Docker and docker compose
-
-Jellyfin (or any compatible client with M3U + XMLTV support)
-
-FlareSolverr — only if you plan to use resolvers that go through it
-
-Quick start
-All required files live in the project root.
-
-1. Create the working data/ directory and copy the examples:
-
-bash
-mkdir -p data
-cp config.example.json   data/config.json
-cp override.example.json data/override.json      # optional
-cp .env.example          .env
-cp docker-compose.example.yml docker-compose.yml
-2. Put your Jellyfin API key into .env:
-
-text
-IPTV_JELLYFIN_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-Create the key in Jellyfin: Dashboard → API Keys → Add.
-Without the key, EPG refreshes on Jellyfin's own schedule — the automatic
-guide-refresh trigger won't work.
-
-3. Edit data/config.json — your channels and EPG sources.
-
-4. Build and start:
-
-bash
-docker compose build iptv-proxy
-docker compose up -d
-5. Open the web UI:
-
-text
-http://<host>:9098/manage
-6. Add to Jellyfin (Live TV):
-
-What	URL
-TV sources (M3U)	http://iptv-proxy:8000/m3u
-Program data sources (XMLTV)	http://iptv-proxy:8000/xmltv.xml.gz
-If Jellyfin doesn't reach IPTV-Proxy through the docker network, replace
-the iptv-proxy hostname with an address reachable from Jellyfin's
-container.
-
-Environment variables
-Variable	Description	Default
-IPTV_JELLYFIN_API_KEY	Jellyfin API key. Needed for the automatic guide-refresh trigger.	—
-IPTV_JELLYFIN_URL	Jellyfin URL inside the docker network.	http://jellyfin:8096
-IPTV_MANAGE_URL	This service's own URL. Used in internal links.	http://iptv-proxy:8000
-IPTV_CONFIG_FILE	Path to the main config inside the container.	/app/config.json
-IPTV_LOG_LEVEL	debug / info / warning / error.	info
-Other tunables (cache TTL, resolver limits, mux idle timeout, healthcheck
-intervals, etc.) are described in config.example.json. You can edit them
-there directly or override them via override.json, which is merged on
-top of the main config at startup.
-
-config.json structure
-Section	Purpose
-epg	EPG sources: URL, refresh interval, filter by id/name, update_time = VACUUM time
-playlist_sources	External M3U playlists used for URL search
-server	manage_url, override file name
-jellyfin	Jellyfin URL, its xmltv cache path, API timeout
-resolver	Default User-Agent, resolver order, timeouts
-cache	Cache TTL per resolver type
-mux	ffmpeg muxer parameters
-healthcheck	Proactive channel-check scheduler
-fallback	Switch to an alternative stream
-limits	Semaphores for parallel resolutions
-logging	Level, buffer size, rotation
-analytics	URL statistics collector (disabled by default)
-channels	Channel list
-EPG: prune old programmes and VACUUM
-Each programmes row carries start_time (unixtime) parsed from the XMLTV
-start attribute. This allows removing old rows without parsing XML.
-
-Logic:
-
-Prune — after each successful import_source. Removes
-programmes older than 7 days. Rows without start_time (pre-migration)
-survive until the next re-import.
-
-VACUUM — once a day at IPTV_EPG_UPDATE_TIME (default 02:35).
-Compacts the DB (PRAGMA wal_checkpoint(TRUNCATE) + VACUUM).
-
-Per-source import schedule — by interval of each source
-(iptvx: 12h, us_guide_nbc: 24h). last_update is read from
-meta.updated_at at startup, so restarts do not reset the timer.
-Empty DB → last_update = 0 → import happens on the first cycle.
-
-IPTV_EPG_UPDATE_TIME is no longer "nightly update of all sources" —
-it is only the VACUUM time.
-
-Channel format
-json
-{
-    "name": "ChannelName",
-    "chno": "1",
-    "group": "News",
-    "tvgid": "channel-id-in-epg",
-    "real_name": "Channel Name as in EPG",
-    "streams": [
-        {
-            "url": "https://site.example/watch",
-            "resolver": "auto",
-            "ua": "Mozilla/5.0 ...",
-            "mux_state": "auto",
-            "stream_id": 3918603096042605
-        }
-    ],
-    "fallback": true
-}
-resolver is one of:
-
-text
-auto | direct | yt-dlp | streamlink
-flaresolverr_simple | flaresolverr_session | sniffer
-auto iterates through the resolvers in resolver.order until one
-succeeds. A specific name forces only that resolver to be used.
-
-The stream_id field is an internal stream identifier (52-bit integer).
-Assigned automatically on add/save. Needed so streams_cache slots do
-not lose their binding when streams are reordered. Do not touch manually.
-
-Manual mux control (mux_state)
-mux_state lives on a stream (streams[i].mux_state). Values:
-
-Value	Behaviour
-auto (default)	As before: mux turns on if the master playlist has #EXT-X-MEDIA:TYPE=AUDIO (split A/V). Computed once, cached in streams_cache[i].needs_mux.
-on	Force mux. Useful when Jellyfin can't read HLS directly: Pluto (AES-128 + ffmpeg 7+ regression), SSAI streams, etc.
-off	Force no-mux. Saves CPU. For dual-input channels (with #EXT-X-MEDIA:TYPE=AUDIO) this leads to video-only playback — Jellyfin does not mux on its own.
-Priority: mux_state of the active stream > needs_mux from cache.
-
-Set from the UI: channel → modal → 🎬 Streams → mux: select next to
-Prefetch. Or directly in config.json.
-
-Note on on: works for any stream where Jellyfin-ffmpeg successfully
-reads raw TS from the muxer. When mux_state (auto ↔ on ↔ off),
-active_stream_index, url, or resolver of the active stream changes,
-iptv-proxy automatically removes Jellyfin's mediainfo cache for that
-channel, so no Jellyfin restart is needed and the old-mode cache does not
-get stuck (see "Jellyfin mediainfo cache" below).
-
-Note on off: if the channel has #EXT-X-MEDIA:TYPE=AUDIO (split
-tracks), Jellyfin cannot mux them itself — it will be silent or fail.
-Use auto or on for those.
-
-Channel events log
-A separate text log with the change history: logs/channel_events.log.
-Line-based, readable via tail -f:
-
-text
-2026-10-02 18:15:23 [NTV] cfg: stream#1 (ivi.ru/...) mux_state: auto -> on (ui)
-2026-10-02 18:16:01 [SkyNews] state: UP -> DOWN (healthcheck)
-2026-10-02 18:17:44 [Euronews] state: DOWN -> UP (ui)
-Prefix cfg: — configuration changes (via UI or EPG auto-match).
-Prefix state: — channel health transitions (UP/DOWN, automatic
-active-stream switches). In parentheses at the end — source: ui,
-healthcheck, fallback, startup, auto_match.
-
-Rotation uses the same settings as the main logs
-(IPTV_LOG_MAX_BYTES, IPTV_LOG_BACKUP_COUNT).
-
-File path: IPTV_CHANNEL_EVENTS_LOG (env) or
-config.json → logging.channel_events_log. Default —
-/app/logs/channel_events.log.
-
-Jellyfin mediainfo cache
-On the first probe of a channel, Jellyfin stores the container info
-(Container: hls or Container: ts) into cache/mediainfo/*.json.
-On subsequent opens it does not re-probe — it reuses the cached format.
-
-If the channel switches delivery mode (HLS ↔ raw TS via mux), the old
-cache breaks playback (Jellyfin-ffmpeg exits with code 183
-"Invalid data found when processing input").
-
-Solution: iptv-proxy automatically removes Jellyfin's mediainfo
-cache for a channel when any of the following changes:
-
-mux_state of the active stream (auto ↔ on ↔ off),
-
-active_stream_index,
-
-url of the active stream,
-
-resolver of the active stream.
-
-On the next open, Jellyfin does a fresh probe and detects the format
-correctly. No Jellyfin restart needed.
-
-Requires a volume mount in docker-compose.yaml:
-
-yaml
-- /opt/docker-compose/configs/jellyfin/cache/mediainfo:/jellyfin-mediainfo-cache
-The path is configurable via IPTV_JELLYFIN_MEDIAINFO_DIR (env) or
-config.json → jellyfin.mediainfo_cache_dir.
-
-External M3U playlists
-The playlist_sources section lets you attach public M3U playlists
-(GitHub, curated lists, etc.) and search them for URLs to use in channel
-streams. This is not a channel import — it is a lookup tool: search,
-check, insert.
-
-json
-"playlist_sources": [
-    {
-        "name": "smolnp_main",
-        "url": "https://raw.githubusercontent.com/smolnp/IPTVru/refs/heads/gh-pages/IPTVru.m3u",
-        "interval": 86400,
-        "disable": true
-    }
-]
-Fields:
-
-Field	Purpose
-name	Unique source name
-url	M3U playlist URL
-interval	Refresh interval in seconds (background, checked once a minute)
-disable	true — do not refresh automatically (still refreshable from the UI)
-Usage:
-
-Playlists tab in the web UI — manage sources: add, edit, refresh
-one, refresh all, clear stored data.
-
-In the channel modal → Streams → 🔍 button next to the URL
-field. A playlist search dialog opens.
-
-Type a channel name (at least 2 characters). Results come from all
-active sources.
-
-Tap a result → 1-second HEAD check.
-
-URL alive — inserted into the stream URL field.
-
-Dead — HTTP code shown, the field is left untouched.
-
-Notes:
-
-No EPG matching. tvg-id from the playlist is ignored. The point
-is to grab the URL. EPG is selected separately in the right column of
-the channel modal.
-
-Tap-check is HEAD only, 1 second. Not ffprobe. For deeper checks
-use the regular "Check stream" / "Check ffprobe" buttons after the
-URL is inserted.
-
-No auto-imports. Channels are added manually via the normal
-modals. Playlists just help find URLs.
-
-#EXTVLCOPT is parsed. If a playlist entry has http-referrer
-or http-user-agent, they land in the payload
-(url|Referer=...|User-Agent=...).
-
-Logos, groups, tvg-id are ignored. Only the URL is taken from the
-playlist (optionally plus headers from #EXTVLCOPT).
-
-disable: true in the example is intentional. Nothing is fetched
-on startup. You enable the sources you want and hit "Refresh".
-
-Endpoints
-Path	Purpose
-/m3u	M3U playlist for Jellyfin
-/xmltv.xml.gz	EPG in XMLTV format (gzip)
-/redirect/{name}.m3u8	Entry point for each channel
-/hls/{name}.{ext}	Universal HLS proxy: ext = m3u8 / ts / key / vtt / m4s / mp4. Extension in the path is required; otherwise Jellyfin-ffmpeg 8+ refuses to open.
-/hls/manifest.m3u8	Legacy route (HLS manifest)
-/hls/segment.ts	Legacy route (segment)
-/mux/{name}.ts	Muxed A/V stream (raw MPEG-TS)
-/manage	Web UI
-/logs	Log viewer
-/status	Short service status
-/events	SSE stream for the UI
-/playlists/sources	GET/POST — list and save M3U playlist sources
-/playlists/refresh/{name}	Refresh one source (background)
-/playlists/refresh-all	Refresh all active sources
-/playlists/clear/{name}	Clear stored source data in SQLite
-/playlists/search?q=...	Search the playlist cache
-/playlists/check	HEAD check used by the UI on tap
-FlareSolverr watchdog
-restart_flaresolverr.sh is an optional script for the case where
-FlareSolverr occasionally gets stuck.
-
-How it works: on a FlareSolverr error, resolver.py drops a flag file at
-flags/flaresolverr_restart.request. The script (run on a timer — for
-example a systemd unit once a minute) sees the flag, restarts the
-container, and removes the flag. A cooldown prevents restart loops.
-
-The script hardcodes the path to the config directory — adjust it to your
-setup. A sample systemd unit is in the script header.
-
-Feedback
-Issues are read. Replies are not guaranteed.
-
-License
-Unlicense — public domain. Do whatever you want, no obligations.
-Full text: LICENSE.
+## Лицензия
+
+Unlicense — public domain. Делайте что хотите, без обязательств. Полный текст:
+`LICENSE`.
+
+---
+
+# English (short summary)
+
+A personal project, published as-is — no plans for further development.
+
+FastAPI service that feeds IPTV channels to Jellyfin as an M3U playlist with EPG.
+It resolves stream URLs itself (direct, yt-dlp, streamlink, FlareSolverr, headless
+Chromium "sniffer"), keeps the links fresh, switches to a backup stream when the
+active one dies, and can mux separately delivered video/audio via ffmpeg.
+
+Key points worth knowing:
+
+- **Cache TTL follows the LINK, not the response.** Live HLS playlists are served
+  with `Cache-Control: no-store`/`max-age=1` even though the URL stays valid for
+  hours; TTL comes from `exp` in the URL, session markers, or the per-method cap.
+- **Checks are scheduled at 0.75 of the shortest remaining link lifetime**, never
+  later than the link itself. Observed early deaths shrink the interval further.
+- **Liveness probing verifies what actually plays** (max-bandwidth variant plus the
+  audio group), with a 3 s / 1.5 MB analysis window and a fast TCP pre-check — a
+  live "endless" SSAI feed must not produce a false DOWN.
+- **The mux warms its inputs before starting** (a cold audio playlist would give a
+  soundless session), uses a single input when the variant already carries both
+  tracks, and marks the payload dead after three 4xx responses.
+- **Endpoint summary:** `/m3u`, `/xmltv.xml.gz`, `/redirect/{name}.m3u8`,
+  `/mux/{name}.ts`, `/manage`, `/status`, `/logs`, `/events`.
+- **Config:** `config.example.json` documents every supported key;
+  `override.example.json` shows temporary overrides (merged on top at startup).
+  The API key goes into the environment (`IPTV_JELLYFIN_API_KEY`).
+
+Full details are in the Russian part above — it is the authoritative version.

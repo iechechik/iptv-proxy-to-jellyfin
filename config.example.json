@@ -1,29 +1,59 @@
 {
+    "comment": "Полная схема настроек. Все ключи, которые читает код, — здесь; чего нет в вашем config.json, берётся из значений по умолчанию в core/config.py. Значения можно переопределять через override.json (см. override.example.json).",
+
     "epg": {
         "sources": [
             {
                 "name": "example_epg",
                 "url": "https://example.com/epg.xml.gz",
                 "interval": 43200,
-                "comment": "Замените URL на реальный источник EPG. Поддерживается gzip и обычный XML."
+                "filter": {
+                    "mode": "all",
+                    "match": "any",
+                    "ids": [],
+                    "names": []
+                },
+                "disable": false,
+                "comment": "Внешний источник расписания. url — XML или XML.gz. interval — строкой («12h», «30m», «2d») или в секундах. filter: mode = all | whitelist | blacklist, match = any | all, ids/names — списки tvg-id и имён программ. disable: true — не обновлять автоматически (можно дёрнуть руками из UI)."
             }
         ],
         "update_time": "02:35",
         "cache_path": "epg_filtered.xml.gz",
         "db_file": "/app/db/epg.db",
         "download_timeout": 60,
-        "head_timeout": 10
+        "head_timeout": 10,
+        "comment_update_time": "Время суточного VACUUM базы EPG. Импорт источников идёт по их собственным interval, а не по этому времени.",
+        "comment_db_file": "SQLite-база расписания. Из неё собирается отфильтрованный XMLTV, который отдаётся на /xmltv.xml.gz.",
+        "comment_cache_path": "Куда класть собранный XMLTV; рядом пишется .md5 для ETag (Jellyfin получает 304 вместо повторной выкачки)."
     },
+
+    "playlist_sources": [
+        {
+            "name": "example_playlist",
+            "url": "https://raw.githubusercontent.com/example/playlist/main/tv.m3u",
+            "interval": 86400,
+            "disable": true,
+            "comment": "Публичные M3U для поиска URL в модалке канала. Это не импорт каналов, а справочник: нашёл, проверил HEAD-ом, подставил в поток. disable: true — при старте ничего не скачивается."
+        }
+    ],
+
     "server": {
         "manage_url": "http://iptv-proxy:8000",
-        "override_file": "override.json"
+        "override_file": "override.json",
+        "comment_manage_url": "URL самого сервиса внутри docker-сети. Используется во внутренних ссылках (в том числе при чистке mediainfo-кэша Jellyfin).",
+        "comment_override_file": "Имя файла, который мёржится поверх config.json при старте. Пусто — не мёржить."
     },
+
     "jellyfin": {
         "url": "http://jellyfin:8096",
         "xmltv_cache_dir": "/jellyfin-xmltv-cache",
+        "mediainfo_cache_dir": "/jellyfin-mediainfo-cache",
         "api_timeout": 15,
-        "comment_api_key": "API-ключ Jellyfin задаётся переменной окружения IPTV_JELLYFIN_API_KEY"
+        "comment_api_key": "API-ключ Jellyfin. Обычно задаётся переменной окружения IPTV_JELLYFIN_API_KEY в docker-compose; ключ здесь тоже читается, но НЕ оставляйте его пустым — пустое значение перекроет переменную окружения. Нужен для автотриггера «обновить расписание».",
+        "comment_mediainfo_cache_dir": "Кэш probe'ов Jellyfin (cache/mediainfo). Сервис сам удаляет файл канала при смене режима доставки, чтобы Jellyfin не «залипал» на старом формате. Требует монтирования этого каталога в контейнер.",
+        "comment_xmltv_cache_dir": "Каталог, куда Jellyfin складывает скачанный XMLTV. По нему видно, когда расписание реально обновилось."
     },
+
     "resolver": {
         "default_ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
         "playwright_chromium": "/usr/bin/chromium",
@@ -39,83 +69,123 @@
         "streamlink_timeout": 30,
         "flaresolverr_timeout": 70,
         "playwright_navigation_timeout": 20,
-        "fetch_timeout": 15
+        "fetch_timeout": 15,
+        "comment_order": "Порядок перебора для resolver=auto. Конкретное имя в потоке заставляет использовать только его.",
+        "comment_playwright_navigation_timeout": "Таймаут навигации headless-браузера (sniffer), секунды.",
+        "comment_fetch_timeout": "Таймаут обычных HTTP-запросов сервиса (манифесты, проверки)."
     },
+
     "cache": {
+        "cache_ttl": 3600,
+        "fast_cache_ttl": 900,
         "failed_resolve_ttl": 60,
         "youtube_cache_ttl": 1800,
-        "cache_ttl": 3600,
-        "fast_cache_ttl": 900
+        "comment_cache_ttl": "Верхний предел жизни payload'а для «долгих» методов (direct).",
+        "comment_fast_cache_ttl": "Верхний предел для sniffer/yt-dlp/streamlink/flaresolverr (их ссылки обычно короче).",
+        "comment_failed_resolve_ttl": "Пауза для потока, который не разрезолвился (чтобы не долбить источник).",
+        "comment_ttl_logic": "Реальный TTL считается по сроку жизни САМОЙ ССЫЛКИ: есть exp в URL — exp минус 75 секунд; сессионные URL — 300 секунд; иначе верхний предел метода выше. Cache-Control/CDN-заголовки для TTL не используются: у живых HLS-плейлистов они почти всегда no-store/max-age=1, то есть говорят о кэшируемости ответа, а не о жизни ссылки.",
+        "comment_scheduling": "Проверка канала планируется на 0.75 от остатка жизни САМОЙ КОРОТКОЙ ссылки канала (обновляем заранее, а не в момент смерти), но не чаще scheduler_min_interval и никогда не позже самой ссылки. Если за каналом замечена ранняя смерть ссылок, интервал автоматически сжимается."
     },
+
     "mux": {
         "max_processes": 4,
         "idle_timeout": 90,
-        "ffmpeg_log_level": "warning"
+        "ffmpeg_log_level": "warning",
+        "comment_idle_timeout": "Сколько секунд держать ffmpeg живым после ухода последнего зрителя.",
+        "comment_ffmpeg_log_level": "warning | info | debug. Поднимать при разборе проблем с микшированием.",
+        "comment_behaviour": "Перед запуском ffmpeg сервис прогревает входы (пустой лист на старте даёт сеанс без звука). Если вариант master'а сам несёт видео+аудио, он идёт одним входом; если аудио вынесено отдельной группой — двумя. Если вход отвечает 4xx, payload помечается мёртвым и переразбирается."
     },
+
     "healthcheck": {
         "workers": 3,
         "scheduler_interval": 60,
         "scheduler_min_interval": 300,
-        "flaresolverr_flag_file": "/app/flags/flaresolverr_restart.request"
+        "recently_active_sec": 120,
+        "flaresolverr_flag_file": "/app/flags/flaresolverr_restart.request",
+        "comment_scheduler_interval": "Как часто планировщик просыпается и смотрит, кому пора на проверку.",
+        "comment_scheduler_min_interval": "Минимальный интервал между проверками канала. Он никогда не ставится длиннее срока жизни самой короткой ссылки канала, иначе payload гарантированно протухает между проверками.",
+        "comment_recently_active_sec": "Канал, который смотрели только что, планировщик не трогает (его проверяет путь по запросу клиента).",
+        "comment_workers": "Параллельные проверки. Уменьшайте, если headless-браузер (sniffer) съедает CPU.",
+        "comment_flag_file": "Файл-триггер для restart_flaresolverr.sh: сервис пишет его, когда FlareSolverr перестал отвечать."
     },
+
     "fallback": {
         "cooldown": 60,
-        "threshold": 40
+        "switch_min_sec_active": 3.0,
+        "switch_speedup_sec": 1.0,
+        "comment_cooldown": "Пауза после неудачного переключения, чтобы не перебирать потоки в цикле.",
+        "comment_switch_min_sec_active": "Минимальная наработка нового потока, чтобы считать его удачным.",
+        "comment_switch_speedup_sec": "Насколько (в секундах) новый поток должен быть быстрее текущего по probe, чтобы его предпочли."
     },
+
     "limits": {
         "sniffer": 3,
         "flaresolverr": 2,
         "probe": 2,
-        "resolver": 3
+        "resolver": 3,
+        "comment": "Семафоры параллельных операций: headless-браузер, FlareSolverr, ffprobe-пробы, прочие резолверы."
     },
+
     "logging": {
         "level": "INFO",
         "dir": "/app/logs",
         "capacity": 2000,
         "max_bytes": 5242880,
-        "backup_count": 3
+        "backup_count": 3,
+        "channel_events_log": "/app/logs/channel_events.log",
+        "comment_capacity": "Сколько строк держать в памяти для отдачи в веб-UI (/logs).",
+        "comment_channel_events_log": "Отдельный журнал событий каналов: изменения конфигурации и переходы UP/DOWN."
     },
+
     "analytics": {
         "enabled": false,
         "interval": 3600,
         "max_bytes": 10485760,
-        "backup_count": 3
+        "backup_count": 3,
+        "comment": "Сборщик статистики URL (JSONL). По умолчанию выключен: полезен, когда разбираетесь, правильно ли угадывается TTL для нестандартного CDN."
     },
+
     "channels": [
         {
-            "name": "Test1",
+            "name": "TestDirect",
             "chno": "1",
             "group": "Test",
-            "tvgid": "test1",
-            "real_name": "Test Channel 1",
+            "tvgid": "test-direct",
+            "real_name": "Test Channel Direct",
+            "comment": "Минимальный канал: один прямой поток.",
             "streams": [
                 {
-                    "url": "https://example.com/test1.m3u8",
-                    "resolver": "direct",
-                    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
+                    "url": "https://example.com/stream.m3u8",
+                    "resolver": "direct"
                 }
-            ],
-            "fallback": true
+            ]
         },
         {
-            "name": "Test2",
+            "name": "TestFallback",
             "chno": "2",
             "group": "Test",
-            "tvgid": "test2",
-            "real_name": "Test Channel 2",
+            "tvgid": "test-fallback",
+            "real_name": "Test Channel Fallback",
+            "fallback": true,
+            "active_stream_index": 0,
+            "comment": "Канал с двумя потоками и fallback'ом. Показаны все поля потока.",
             "streams": [
                 {
-                    "url": "https://example.com/page.html",
+                    "url": "https://example.com/watch/page.html",
                     "resolver": "sniffer",
-                    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
+                    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+                    "stream_id": 3918603096042605,
+                    "prefetch": true,
+                    "mux_state": "auto",
+                    "comment": "resolver: auto | direct | yt-dlp | streamlink | flaresolverr_simple | flaresolverr_session | sniffer. stream_id — внутренний идентификатор потока (нужен, чтобы слоты кэша не съезжали при переупорядочивании; назначается сам). prefetch — предзагружать первый сегмент до запроса клиента. mux_state: auto | on | off — принудительно включить или выключить микширование A/V."
                 },
                 {
-                    "url": "https://example.com/test2.m3u8",
+                    "url": "https://example.com/stream2.m3u8",
                     "resolver": "direct",
-                    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
+                    "disable": false,
+                    "comment": "disable: true — поток не используется, но остаётся в списке."
                 }
-            ],
-            "fallback": true
+            ]
         }
     ]
 }

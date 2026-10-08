@@ -1,5 +1,10 @@
 # Пример docker-compose для IPTV-Proxy.
 #
+# Что стоит проверить под свой сетап:
+#   - порт 9098 (наружу) и IPTV_JELLYFIN_API_KEY;
+#   - каталог ./data — в нём лежат config.json, override.json, logs/, db/;
+#   - монтирование mediainfo-кэша Jellyfin (нужно для авто-сброса кэша канала);
+#   - монтирование xmltv-кэша Jellyfin — по нему видно, когда расписание доехало.
 services:
   iptv-proxy:
     container_name: iptv-proxy
@@ -16,8 +21,9 @@ services:
     ports:
       - "9098:8000"
     volumes:
-      - ./data:/app
-      - xmltv-cache:/jellyfin-xmltv-cache #### доступ к каталогу jellyfin, в котором хранится кэш xmltv
+      - ./data:/app                                  #### config.json, override.json, logs/, db/
+      - xmltv-cache:/jellyfin-xmltv-cache            #### каталог с xmltv-кэшем Jellyfin (для сверки обновлений)
+      - ./jellyfin-config/cache/mediainfo:/jellyfin-mediainfo-cache  #### медиаинфо-кэш Jellyfin: сервис сам чистит в нём запись канала при смене режима доставки (HLS ↔ raw TS), иначе Jellyfin «залипает» на старом формате
     environment:
       TZ: Europe/Moscow
       IPTV_LOG_LEVEL: info
@@ -97,3 +103,6 @@ services:
 networks:
   dockernet:
     driver: bridge
+
+volumes:
+  xmltv-cache:
