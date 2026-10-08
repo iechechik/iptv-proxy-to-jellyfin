@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 
 import core.state as state
-from core.config import IPTV_DEFAULT_UA, IPTV_FETCH_TIMEOUT, logger
+from core.config import IPTV_DEFAULT_UA, IPTV_FETCH_TIMEOUT, IPTV_RESOLVE_TIMEOUT, logger
 from services.resolver import parse_url_headers
 from services.hls_utils import select_playable, probe_stream_types
 from services.proxy_service import (
@@ -61,12 +61,12 @@ async def mux_stream(name: str, request: Request):
             try:
                 is_direct, payload, expire_time, method = await asyncio.wait_for(
                     asyncio.to_thread(state.get_channel_stream, name),
-                    timeout=30.0,
+                    timeout=float(IPTV_RESOLVE_TIMEOUT),
                 )
                 cached_stream = payload
                 logger.info(f"[MUX] '{name}': re-resolved, {cached_stream[:80]}...")
             except asyncio.TimeoutError:
-                logger.error(f"[MUX] '{name}': resolve timeout (>30s)")
+                logger.error(f"[MUX] '{name}': resolve timeout (>{IPTV_RESOLVE_TIMEOUT}s)")
                 return Response("Resolve timeout", status_code=504)
             except Exception as e:
                 logger.error(f"[MUX] '{name}': re-resolve failed: {e}")

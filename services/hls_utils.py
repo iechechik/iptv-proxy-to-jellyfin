@@ -142,6 +142,22 @@ def _is_ad_url(url: str) -> bool:
     return any(m in low for m in _AD_URL_MARKERS)
 
 
+_ERROR_URL_MARKERS = ("error=", "err=")
+
+
+def _is_error_url(url: str) -> bool:
+    """URL — ответ об ошибке, а не манифест.
+
+    Часть плееров отдаёт не поток, а ошибку прямо в URL вида
+    `.../manifest/video/xxxx.m3u8?error=1108`. По имени это похоже на манифест,
+    но играть его нельзя, поэтому такие кандидаты отбрасываются.
+    """
+    if not url:
+        return False
+    low = url.split("|", 1)[0].lower()
+    return any(m in low for m in _ERROR_URL_MARKERS)
+
+
 # ---------- Общие правила: что реально играет и жив ли хост ----------
 _VARIANT_BW_RE = re.compile(r"BANDWIDTH=(\d+)", re.IGNORECASE)
 _MEDIA_URI_RE = re.compile(r'URI="([^"]+)"', re.IGNORECASE)

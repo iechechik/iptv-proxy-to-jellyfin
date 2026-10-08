@@ -135,6 +135,13 @@ IPTV_STREAMLINK_TIMEOUT = int(os.getenv("IPTV_STREAMLINK_TIMEOUT", "30"))
 IPTV_FLARESOLVERR_TIMEOUT = int(os.getenv("IPTV_FLARESOLVERR_TIMEOUT", "70"))
 IPTV_PLAYWRIGHT_NAVIGATION_TIMEOUT = int(os.getenv("IPTV_PLAYWRIGHT_NAVIGATION_TIMEOUT", "20")) * 1000
 IPTV_FETCH_TIMEOUT = int(os.getenv("IPTV_FETCH_TIMEOUT", "15"))
+# Потолок ожидания добычи ссылки на клиентский запрос (/redirect, /mux):
+# сколько клиент готов ждать, пока резолвер ищет поток. Это ПОТОЛОК, а не
+# задержка — быстро резолвящие каналы отвечают как раньше. Значение должно
+# быть не меньше бюджета самого медленного метода (сниффер: навигация
+# playwright_navigation_timeout + проба), иначе медленные каналы обречены
+# отдавать чёрный экран (/redirect) или 504 (/mux).
+IPTV_RESOLVE_TIMEOUT = int(os.getenv("IPTV_RESOLVE_TIMEOUT", "60"))
 
 IPTV_FAILED_RESOLVE_TTL = int(os.getenv("IPTV_FAILED_RESOLVE_TTL", "60"))
 IPTV_YOUTUBE_CACHE_TTL = int(os.getenv("IPTV_YOUTUBE_CACHE_TTL", "1800"))
@@ -313,6 +320,7 @@ if CONFIG_DATA:
     IPTV_STREAMLINK_TIMEOUT = get_config_value("resolver", "streamlink_timeout", IPTV_STREAMLINK_TIMEOUT)
     IPTV_FLARESOLVERR_TIMEOUT = get_config_value("resolver", "flaresolverr_timeout", IPTV_FLARESOLVERR_TIMEOUT)
     IPTV_FETCH_TIMEOUT = get_config_value("resolver", "fetch_timeout", IPTV_FETCH_TIMEOUT)
+    IPTV_RESOLVE_TIMEOUT = get_config_value("resolver", "resolve_timeout", IPTV_RESOLVE_TIMEOUT)
     IPTV_RESOLVER_ORDER = get_config_value("resolver", "order", IPTV_RESOLVER_ORDER)
 
     nav_timeout_sec = CONFIG_DATA.get("resolver", {}).get("playwright_navigation_timeout")
@@ -640,6 +648,7 @@ def save_full_config(channels: list = None) -> bool:
         "flaresolverr_timeout": IPTV_FLARESOLVERR_TIMEOUT,
         "playwright_navigation_timeout": IPTV_PLAYWRIGHT_NAVIGATION_TIMEOUT // 1000,
         "fetch_timeout": IPTV_FETCH_TIMEOUT,
+        "resolve_timeout": IPTV_RESOLVE_TIMEOUT,
     }
     CONFIG_DATA["cache"] = {
         "failed_resolve_ttl": IPTV_FAILED_RESOLVE_TTL,

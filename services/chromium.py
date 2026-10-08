@@ -22,7 +22,7 @@ from core.config import (
 )
 from services.hls_utils import (
     _is_ad_url, _extract_url_expiry, _EXPIRY_SAFETY_MARGIN,
-    probe_stream_types,
+    probe_stream_types, _is_error_url,
 )
 from services.ad_detect import _is_ad_manifest
 
@@ -256,12 +256,17 @@ def _candidate_expired(url: str) -> bool:
 
 
 def _candidate_usable(c: dict) -> bool:
-    """Годится ли m3u8-кандидат: не реклама, без 4xx/5xx и токен не истёк.
+    """Годится ли m3u8-кандидат: не реклама, без 4xx/5xx, токен не истёк.
 
     status=None (ответа ещё не видели) считаем годным — это случай, когда тело
     манифеста не успело прочитаться под нагрузкой, а URL рабочий.
+    Но если запрос вообще НЕ состоялся (DNS/connect/abort) или URL сам является
+    ответом об ошибке — такой кандидат негоден: по имени он может выглядеть
+    мастером, а играть его нельзя (sniffer-failed-v1).
     """
-    if c.get("is_ad"):
+    if c.get("is_ad") or c.get("failed"):
+        return False
+    if _is_error_url(c.get("url", "")):
         return False
     st = c.get("status")
     if isinstance(st, int) and st >= 400:
@@ -284,6 +289,13 @@ def _pick_best_candidate(candidates: list, channel_name: str = None):
     # иначе probe получает 403, и живой канал ложно уходит в DOWN.
     usable = [c for c in candidates
               if c.get("type") == "m3u8" and _candidate_usable(c)]
+    # sniffer-verified-first-v1: если есть кандидаты, которые браузер реально
+    # получил (2xx), выбираем только из них. Кандидат, известный лишь по имени
+    # запроса (ответа не видели), может оказаться нерабочим URL'ом — и тогда
+    # живой канал уходит в DOWN, хотя рабочий кандидат лежал рядом.
+    _verified = [c for c in usable if c.get("verified")]
+    if _verified:
+        usable = _verified
     for c in candidates:
         if c.get("type") == "m3u8" and not _candidate_usable(c):
             logger.info(
@@ -429,6 +441,14 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int, skip_u
                     for c in candidates:
                         if c.get("url") == url:
                             c["status"] = response.status
+                            # sniffer-verified-v1: ответ реально получен (2xx) —
+                            # такого кандидата считаем проверенным, он приоритетнее
+                            # того, о котором знаем только из запроса.
+                            try:
+                                if 200 <= int(response.status) < 400:
+                                    c["verified"] = True
+                            except Exception:
+                                pass
                             break
                 if any(ext in low for ext in [".ts", ".m4s", ".key", ".aac", ".mp4", ".m4a"]):
                     return
@@ -493,6 +513,22 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int, skip_u
 
             page.on("request", handle_request)
             page.on("response", handle_response)
+
+            def handle_failed(request):
+                # sniffer-failed-v1: запрос вообще не состоялся (DNS/connect/abort).
+                # По имени такой URL может выглядеть мастером, но играть его нельзя:
+                # наблюдали выбор `.../manifest/video/...?error=1108` с хоста, который
+                # резолвится в 0.0.0.0, — канал после этого ложно уходил в DOWN.
+                try:
+                    u = request.url
+                except Exception:
+                    return
+                for c in candidates:
+                    if c.get("url") == u:
+                        c["failed"] = True
+                        logger.info(f"[SNIFFER] candidate failed ({str(request.failure)[:50]}): {u[:110]}")
+                        return
+            page.on("requestfailed", handle_failed)
 
             try:
                 logger.info(f"[SNIFFER] loading: {target_url}")

@@ -15,7 +15,7 @@ import time
 from urllib.parse import quote
 
 import core.state as state
-from core.config import IPTV_FAILED_RESOLVE_TTL, logger
+from core.config import IPTV_FAILED_RESOLVE_TTL, IPTV_RESOLVE_TIMEOUT, logger
 from services.resolver import parse_url_headers
 from services.proxy_service import (
     _proxy_googlevideo_manifest, _build_redirect_response,
@@ -232,10 +232,10 @@ async def redirect_channel(name: str, request: Request):
     try:
         is_direct, payload, expire_time, method = await asyncio.wait_for(
             asyncio.to_thread(state.get_channel_stream, name),
-            timeout=30.0,
+            timeout=float(IPTV_RESOLVE_TIMEOUT),
         )
     except asyncio.TimeoutError:
-        logger.error(f"[STREAM] '{name}': resolve timeout (>30s)")
+        logger.error(f"[STREAM] '{name}': resolve timeout (>{IPTV_RESOLVE_TIMEOUT}s)")
         return _handle_stream_failure(name, active_idx, "Резолв превысил таймаут", now)
     except ValueError as ve:
         logger.error(f"[STREAM] {ve}")
@@ -253,7 +253,7 @@ async def redirect_channel(name: str, request: Request):
                 try:
                     is_direct, payload, expire_time, method = await asyncio.wait_for(
                         asyncio.to_thread(state.get_channel_stream, name),
-                        timeout=30.0,
+                        timeout=float(IPTV_RESOLVE_TIMEOUT),
                     )
                     return _build_stream_response(name, request, is_direct, payload, expire_time, method, active_idx=active_idx)
                 except Exception as e2:
