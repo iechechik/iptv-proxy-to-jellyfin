@@ -1,8 +1,9 @@
 """Временный сборщик статистики URL для анализа TTL-логики.
 
-Задача — понять, покрывают ли текущие эвристики в resolver.py
-(_extract_url_expiry, _is_session_url, _parse_cache_control_ttl) все
-реальные URL из streams_cache.
+Задача — понять, покрывают ли текущие эвристики срока жизни ссылки
+(_extract_url_expiry, _is_session_url) все реальные URL из streams_cache.
+(Ранее здесь же упоминалась Cache-Control-эвристика — она убрана: TTL считается
+по сроку жизни ссылки, а не по кэшируемости ответа.)
 
 Раз в INTERVAL_SECONDS проходит по _epg_cache, для каждого payload'а:
   - извлекает чистый URL (без |Referer|Cookie);

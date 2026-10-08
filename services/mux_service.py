@@ -2,12 +2,57 @@ import subprocess
 import threading
 import asyncio
 import time
+import re
+import gzip
+import urllib.request
 
 from core.config import logger, IPTV_MUX_MAX_PROCESSES, IPTV_MUX_IDLE_TIMEOUT, IPTV_FFMPEG_LOG_LEVEL
 # mux-debug-cleanup-v1
 
 _mux_lock = threading.Lock()
 _mux_processes = {}  # name -> MuxProcess
+
+# Сколько 4xx от входа мукса считаем смертью ссылки (а не разовой заминкой),
+# прежде чем пометить payload мёртвым и перезапустить разбор.
+_MUX_INPUT_ERROR_LIMIT = 3
+
+
+# mux-warm-v1: прогрев входов мукса перед запуском ffmpeg.
+#
+# У CDN-эджей первый запрос к дочернему плейлисту может вернуть пустой список
+# (эдж ещё не сходил наверх за потоком). ffmpeg с двумя входами решает маппинг
+# ОДИН раз при старте: если в этот момент в аудио-листе нет сегментов, звука не
+# будет во всём сеансе, пока мукс не перезапустят (наблюдали на Р_Культуре:
+# «первый запуск без звука, после переоткрытия канала звук есть»).
+def _warm_input(name, url, label, ua, referer=None, cookie=None, attempts=3, wait=0.7) -> bool:
+    """Тянет плейлист, пока в ответе не появятся сегменты (#EXTINF)."""
+    if not url:
+        return False
+    headers = {"User-Agent": ua or "Mozilla/5.0"}
+    if referer:
+        headers["Referer"] = referer
+    if cookie:
+        headers["Cookie"] = cookie
+    for i in range(1, attempts + 1):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                raw = resp.read(200000)
+                if resp.headers.get("Content-Encoding") == "gzip":
+                    raw = gzip.decompress(raw)
+                body = raw.decode("utf-8", errors="ignore")
+            if "#EXTINF" in body:
+                if i > 1:
+                    logger.info(f"[MUX] '{name}': {label}-вход прогрет с попытки {i}")
+                return True
+            logger.info(f"[MUX] '{name}': {label}-вход пуст (попытка {i}/{attempts}), ждём")
+        except Exception as e:
+            logger.info(f"[MUX] '{name}': прогрев {label}-входа, попытка {i}/{attempts}: {e}")
+        if i < attempts:
+            time.sleep(wait)
+    logger.warning(f"[MUX] '{name}': {label}-вход не прогрелся за {attempts} попыток — стартуем как есть")
+    return False
+
 
 # Если из stdout ffmpeg давно нет данных, а процесс жив —
 # считаем его зависшим на мёртвом источнике и убиваем.
@@ -131,14 +176,23 @@ class MuxProcess:
             if headers_str:
                 cmd += ["-headers", headers_str]
             # Два входа: video отдельно, audio отдельно, синхронизация PTS.
+            # mux-optional-audio-v1: "1:a:0?" — если в аудио-входе аудио нет
+            # (например, из sniffer'а пришёл не тот лист), ffmpeg не падает
+            # целиком ("Invalid argument" → exit 234), а отдаёт видео.
             cmd += reconnect_opts + [
                     "-isync", "0",
                     "-user_agent", ua, "-i", audio_url,
                     "-muxdelay", "0",
-                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-map", "0:v:0", "-map", "1:a:0?",
                     "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
                     "-flush_packets", "1",
                     "-f", "mpegts", "pipe:1"]
+        # mux-warm-v1: прогреваем входы ДО запуска ffmpeg — иначе холодный
+        # аудио-лист на старте даёт беззвучный сеанс (см. _warm_input).
+        _warm_input(name, video_url, "video", ua, referer, cookie)
+        if not single_input:
+            _warm_input(name, audio_url, "audio", ua, referer, cookie)
+
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
@@ -159,6 +213,9 @@ class MuxProcess:
         self._loop = None
         self._last_stderr_line = None
         self._last_stderr_repeat_log = 0.0
+        # mux-input-death-v1: сколько раз вход ответил 4xx и признан ли он мёртвым
+        self._http_error_count = 0
+        self._input_dead = False
         # Рейтлимит queue-FULL warning.
         self._queue_full_last_log = 0.0
         self._queue_full_dropped = 0
@@ -221,6 +278,19 @@ class MuxProcess:
                     self._last_stderr_line = line
                     self._last_stderr_repeat_log = now
                     lowered = line.lower()
+                    # mux-input-death-v1: вход умер (CDN отвечает 4xx на плейлист).
+                    # ffmpeg будет ходить по кругу, отдавая клиенту пустоту —
+                    # помечаем payload мёртвым и гасим процесс, чтобы следующая
+                    # попытка переразобрала master, а не ждала healthcheck.
+                    if re.search(r"http error 4\d\d", lowered):
+                        self._http_error_count += 1
+                        if self._http_error_count >= _MUX_INPUT_ERROR_LIMIT and not self._input_dead:
+                            self._input_dead = True
+                            logger.warning(
+                                f"[MUX] '{self.name}': вход отвечает ошибкой "
+                                f"{self._http_error_count}-й раз подряд — payload помечаю мёртвым"
+                            )
+                            threading.Thread(target=self._on_input_dead, daemon=True).start()
                     if "error" in lowered or "fatal" in lowered or "invalid" in lowered:
                         logger.error(f"[MUX] '{self.name}': ffmpeg: {line}")
                     elif "thread message queue blocking" in lowered or "warning" in lowered:
@@ -350,6 +420,22 @@ class MuxProcess:
             pass
         logger.info(f"[MUX] '{self.name}': process stopped")
 
+    def _on_input_dead(self):
+        """Вход мукса мёртв: помечаем payload мёртвым и убираем процесс.
+
+        Дальше канал переразбирается по обычному пути (healthcheck/следующий
+        запрос), а не ждёт плановой проверки с мёртвой ссылкой в кэше.
+        """
+        try:
+            from services.proxy_service import mark_payload_dead
+            mark_payload_dead(self.name)
+        except Exception as e:
+            logger.warning(f"[MUX] '{self.name}': mark_payload_dead failed: {e}")
+        try:
+            invalidate_mux(self.name)
+        except Exception as e:
+            logger.warning(f"[MUX] '{self.name}': invalidate_mux failed: {e}")
+
 
 def is_mux_alive_and_fresh(name, max_stall=15, require_subscribers=True):
     """True, если для канала есть живой мукс-процесс, недавно отдававший данные.
@@ -368,6 +454,23 @@ def is_mux_alive_and_fresh(name, max_stall=15, require_subscribers=True):
         if require_subscribers and not mp.has_subscribers():
             return False
         return (time.time() - mp.last_data_time) < max_stall
+
+
+def get_live_mux(name):
+    """Живой mux-процесс канала или None.
+
+    Нужен, чтобы не ходить за master'ом к CDN, когда ffmpeg уже работает: он
+    читает свои ранее разобранные video/audio URL, и master ему не нужен. Без
+    этой проверки /mux на КАЖДЫЙ запрос заново загружал master — а если
+    подписанная ссылка успела протухнуть, ответ был 404 и клиент уходил в
+    шторм ретраев (наблюдали на Euronews)."""
+    if not name:
+        return None
+    with _mux_lock:
+        mp = _mux_processes.get(name)
+        if mp and mp.proc.poll() is None:
+            return mp
+    return None
 
 
 def get_or_create_mux(name, video_url, audio_url, ua, referer=None, cookie=None):

@@ -46,6 +46,10 @@ from services.hls_utils import (        # noqa: F401
     _extract_url_expiry,
     _is_session_url,
     _SESSION_URL_MARKERS,
+    select_playable,
+    probe_stream_types,
+    fetch_manifest_text,
+    tcp_reachable,
 )
 from services.ad_detect import _is_ad_manifest              # noqa: F401
 from services.chromium import (         # noqa: F401
@@ -309,6 +313,19 @@ def _resolve_flaresolverr_session(ch):
     return True, payload, _compute_cache_expire(payload, "flaresolverr_session"), "flaresolverr_session"
 
 
+def _normalize_embed_url(url: str) -> str:
+    """youtube-nocookie.com/embed/<id> -> youtube.com/embed/<id>.
+
+    streamlink не понимает youtube-nocookie (возвращает пустой результат), а
+    yt-dlp на embed-странице отдаёт поток без аудио. Обычный youtube.com/embed/<id>
+    streamlink берёт и возвращает полный поток (проверено на Al Jazeera).
+    """
+    m = re.search(r"/embed/([A-Za-z0-9_-]{6,})", url)
+    if "youtube-nocookie.com" in url and m:
+        return f"https://www.youtube.com/embed/{m.group(1)}"
+    return url
+
+
 def _resolve_browser_sniffer(ch):
     name = ch["name"]
     sniff_res = resolve_via_browser_sniffer(ch["url"], ch.get("ua", IPTV_DEFAULT_UA))
@@ -316,12 +333,19 @@ def _resolve_browser_sniffer(ch):
         raise RuntimeError("sniffer не нашёл m3u8/embed")
     if sniff_res["type"] == "m3u8":
         payload = sniff_res["url"]
-        cc = sniff_res.get("cache_control")
-        return True, payload, _compute_cache_expire(payload, "sniffer", cache_control=cc), "sniffer"
+        # sniffer-master-leaves-v1: синтетический payload (листья master'а) — это
+        # не URL, а манифест, поэтому is_direct=False: /redirect должен уйти в
+        # mux-ветку, а не отдавать манифест как ссылку.
+        _is_direct = not payload.startswith("#EXTM3U")
+        return _is_direct, payload, _compute_cache_expire(payload, "sniffer"), "sniffer"
     elif sniff_res["type"] == "embed":
         embed_url = sniff_res["url"]
         logger.info(f"[RESOLVE] '{name}': sniffer found embed: {embed_url}")
         if is_youtube_url(embed_url):
+            norm = _normalize_embed_url(embed_url)
+            if norm != embed_url:
+                logger.info(f"[RESOLVE] '{name}': embed normalized: {norm}")
+                embed_url = norm
             is_direct, payload, expire, _ = resolve_youtube_stream(embed_url, ch.get("ua", IPTV_DEFAULT_UA), name)
             return is_direct, payload, expire, "sniffer"
         try:
@@ -456,10 +480,28 @@ def probe_stream(payload: str, timeout: int = 10, channel: str = None) -> dict:
                 break
         if not video_url:
             return {"ok": False, "detail": "No video URL in synthetic manifest"}
+        # probe-playable-v1: в синтетическом манифесте аудио вынесено отдельной
+        # группой, а мукс тянет оба листа — поэтому проверяем и аудио-лист,
+        # иначе проба скажет «ок», а канал будет без звука.
+        _pick = select_playable(payload, video_url)
+        if _pick.get("audio"):
+            if "#EXTINF" not in fetch_manifest_text(_pick["audio"], timeout=3):
+                logger.warning(f"[PROBE] {ch_pfx}аудио-лист не отдаётся: {_pick['audio'][:100]}")
+                return {"ok": False, "detail": "audio group playlist not playable"}
+            video_url = _pick.get("video") or video_url
         clean_url, _ = parse_url_headers(video_url)
     start_time = time.time()
+    # probe-fast-fail-v1: мёртвый хост отсекаем TCP-коннектом (3 с) вместо
+    # ожидания ffprobe (на канале с двумя неотвечающими источниками ffprobe
+    # висел ~45 с на каждом, то есть клиент ждал резолв ~90 с).
+    if not tcp_reachable(clean_url, timeout=3):
+        logger.warning(f"[PROBE] {ch_pfx}хост не отвечает (TCP): {clean_url[:100]}")
+        return {"ok": False, "detail": f"tcp connect failed: {urllib.parse.urlsplit(clean_url).netloc}"}
     if "googlevideo.com" in clean_url or "youtube.com" in clean_url or "manifest.googlevideo.com" in clean_url:
         cmd = ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name", "-of", "json",
+               # probe-bounded-analysis-v1: см. ниже — не даём живому потоку
+               # читаться до таймаута (иначе ложный DOWN).
+               "-analyzeduration", "3000000", "-probesize", "1500000",
                "-timeout", str(timeout * 1000000)]
         headers_str = ""
         if headers_dict.get("Referer"):
@@ -497,9 +539,37 @@ def probe_stream(payload: str, timeout: int = 10, channel: str = None) -> dict:
     url_path_lower = urllib.parse.urlsplit(clean_url).path.lower()
     is_media_direct = url_path_lower.endswith((".m3u8", ".mpd", ".ts", ".mp4"))
     if is_media_direct:
+        # probe-playable-v1: если payload — master, проверяем не его самого, а то,
+        # что реально пойдёт в плеер: вариант с максимальным битрейтом и (когда
+        # есть) аудио-группу. Master может отдаваться 200, пока его вариант уже
+        # мёртв — тогда проба говорит «всё ок», а канал не играет.
+        _hdrs_ua = headers_dict.get("User-Agent")
+        _hdrs_ref = headers_dict.get("Referer")
+        _hdrs_ck = headers_dict.get("Cookie")
+        if not url_path_lower.endswith((".ts", ".mp4", ".mpd")):
+            # путь master'а не обязан кончаться на .m3u8 (у части CDN это
+            # /manifest/<token>/prod и подобное), поэтому пробуем разобрать
+            # любой не-сегментный URL: fetch_manifest_text сам отбросит двоичное
+            _text = fetch_manifest_text(clean_url, ua=_hdrs_ua, referer=_hdrs_ref,
+                                        cookie=_hdrs_ck, timeout=3)
+            if _text and "#EXT-X-STREAM-INF" in _text:
+                _pick = select_playable(_text, clean_url)
+                if _pick.get("audio"):
+                    _a = fetch_manifest_text(_pick["audio"], ua=_hdrs_ua, referer=_hdrs_ref,
+                                             cookie=_hdrs_ck, timeout=3)
+                    if "#EXTINF" not in _a:
+                        logger.warning(f"[PROBE] {ch_pfx}аудио-группа не отдаётся: {_pick['audio'][:100]}")
+                        return {"ok": False, "detail": "audio group playlist not playable"}
+                if _pick.get("video"):
+                    clean_url = _pick["video"]
         cmd = ["ffprobe", "-v", "error",
                "-show_entries", "stream=codec_type,codec_name", "-of", "json",
-               "-timeout", str((timeout + 25) * 1000000)]  # probe-timeout-v2
+               # probe-bounded-analysis-v1: ограничиваем разбор 3 с/1.5 МБ, как это
+               # делает плеер. Без этого на «бесконечных» живых плейлистах
+               # (склейка рекламы/SSAI) ffprobe читает поток до таймаута и канал
+               # получает ложный DOWN, хотя он играет.
+               "-analyzeduration", "3000000", "-probesize", "1500000",
+               "-timeout", str(timeout * 1000000)]
         headers_str = ""
         if headers_dict.get("Referer"):
             headers_str += f"Referer: {headers_dict['Referer']}\r\n"

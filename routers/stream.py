@@ -19,7 +19,7 @@ from core.config import IPTV_FAILED_RESOLVE_TTL, logger
 from services.resolver import parse_url_headers
 from services.proxy_service import (
     _proxy_googlevideo_manifest, _build_redirect_response,
-    needs_mux, BLACK_MANIFEST,
+    needs_mux, BLACK_MANIFEST, stale_gate_remaining,
 )
 from services.fallback import try_switch_to_healthy_stream
 from services.healthcheck import revalidate_channel_in_background
@@ -183,6 +183,15 @@ def _handle_stream_failure(name: str, active_idx: int, error: str, now: float):
 async def redirect_channel(name: str, request: Request):
     state.cleanup_expired_caches()
     state.mark_channel_active(name)
+
+    # stale-gate-v1: если для канала уже идёт переразбор протухшей ссылки (его
+    # заказал /mux, получив 403 от CDN) — отвечаем 503 сразу, не уходя в
+    # блокирующий резолв на 30 с.
+    gate = stale_gate_remaining(name)
+    if gate > 0:
+        logger.info(f"[STREAM] '{name}': stale gate active ({gate:.1f}s), answering 503")
+        return Response("Re-resolving stream", status_code=503,
+                        headers={"Retry-After": "3"})
 
     active_idx = state.get_active_index(name)
     with state.cache_lock:

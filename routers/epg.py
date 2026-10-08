@@ -130,27 +130,85 @@ def rebuild_epg():
     threading.Thread(target=background_task, daemon=True).start()
     return RedirectResponse("/manage", status_code=303)
 
+# xmltv-etag-v1
+# Jellyfin при RefreshGuide дёргает /xmltv.xml.gz отдельно для каждого
+# канала (46 запросов × 0.7 МБ). Из-за Cache-Control: no-store Jellyfin
+# не может использовать кэш, каждый запрос — полная выкачка.
+#
+# Теперь отдаём:
+#   Cache-Control: no-cache        (можно кэшировать, но проверяй)
+#   Last-Modified: <mtime>         (If-Modified-Since)
+#   ETag: "<md5>"                  (If-None-Match)
+# На совпадение ETag/If-Modified-Since возвращаем 304 без тела.
+# ETag берём из IPTV_EPG_CACHE_PATH.md5, который пишет build_filtered_epg.
 @router.get("/xmltv.xml.gz")
-def get_xmltv():
+def get_xmltv(request: Request):
     if not os.path.exists(IPTV_EPG_CACHE_PATH):
         return Response("EPG not ready yet", status_code=503)
 
     mtime = os.path.getmtime(IPTV_EPG_CACHE_PATH)
     last_modified = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
 
+    # ETag — md5 от XML. Файл .md5 пишется build_filtered_epg рядом с .gz.
+    etag = None
+    md5_path = IPTV_EPG_CACHE_PATH + ".md5"
+    if os.path.exists(md5_path):
+        try:
+            with open(md5_path, "r") as f:
+                etag = f.read().strip() or None
+        except Exception:
+            etag = None
+
+    # If-None-Match: клиент прислал ETag последней версии.
+    client_etag = request.headers.get("if-none-match") if request else None
+    if client_etag and etag:
+        # Может содержать список "etag1, etag2" и слабые etag W/"..." —
+        # для нас достаточно точного совпадения с нашим etag (в кавычках).
+        candidates = [c.strip().strip('W/').strip('"') for c in client_etag.split(",")]
+        if etag in candidates or etag.strip('"') in candidates:
+            return Response(
+                status_code=304,
+                headers={
+                    "ETag": f'"{etag}"',
+                    "Last-Modified": last_modified,
+                    "Cache-Control": "no-cache",
+                },
+            )
+
+    # If-Modified-Since: клиент прислал дату последнего скачанного файла.
+    ims = request.headers.get("if-modified-since") if request else None
+    if ims and not client_etag:
+        try:
+            from email.utils import parsedate_to_datetime
+            ims_dt = parsedate_to_datetime(ims)
+            if ims_dt is not None:
+                mtime_dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
+                if int(mtime_dt.timestamp()) <= int(ims_dt.timestamp()):
+                    return Response(
+                        status_code=304,
+                        headers={
+                            "Last-Modified": last_modified,
+                            "Cache-Control": "no-cache",
+                        },
+                    )
+        except Exception:
+            pass
+
     with open(IPTV_EPG_CACHE_PATH, "rb") as f:
         data = f.read()
+
+    headers = {
+        "Content-Disposition": "attachment; filename=epg.xml.gz",
+        "Cache-Control": "no-cache",
+        "Last-Modified": last_modified,
+    }
+    if etag:
+        headers["ETag"] = f'"{etag}"'
 
     return Response(
         data,
         media_type="application/x-gzip",
-        headers={
-            "Content-Disposition": "attachment; filename=epg.xml.gz",
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
-            "Last-Modified": last_modified,
-        }
+        headers=headers,
     )
 
 @router.get("/epg/sources")

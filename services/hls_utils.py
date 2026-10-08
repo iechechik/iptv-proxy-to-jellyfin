@@ -1,12 +1,17 @@
-"""
-services/hls_utils.py — общие утилиты для HLS-потоков:
+"""services/hls_utils.py — общие утилиты для HLS-потоков:
   - parse_url_headers — разбор payload с |Referer=|Cookie=
   - TTL-логика по Cache-Control / expire в URL
   - детект рекламных URL и тегов в HLS-манифестах
+  - select_playable / probe_stream_types / tcp_reachable — общие правила
+    «что реально играет» и «жив ли хост» (используются и муксом, и пробой,
+    и сниффером, чтобы не расползались разные версии одной логики)
 """
 import re
+import socket
+import subprocess
 import time
 import urllib
+import urllib.parse
 import urllib.request
 import urllib.error
 
@@ -32,14 +37,10 @@ def parse_url_headers(raw_url: str):
 
 
 # ---------- TTL ----------
-_MIN_CDN_TTL = 30
-_TTL_NO_STORE = 30
-_TTL_NO_CACHE = 60
-_TTL_MUST_REVALIDATE = 60
+# ttl-url-lifetime-v1: TTL считается по сроку жизни ссылки (см. _compute_cache_expire),
+# поэтому константы Cache-Control из проекта убраны.
 _FAST_CAP = min(IPTV_FAST_CACHE_TTL, 600)
 _SESSION_TTL_CAP = 300
-_SNIFFER_HEAD_CAP = _FAST_CAP
-_SNIFFER_NO_INFO_TTL = min(_FAST_CAP, 180)
 
 _SESSION_URL_MARKERS = (
     ".php", ".asp", ".aspx", ".jsp",
@@ -52,10 +53,13 @@ _URL_EXPIRY_PATTERNS = (
     re.compile(r"[?&]expires=(\d{10})", re.IGNORECASE),
     re.compile(r"[?&]expire_at=(\d{10})", re.IGNORECASE),
     re.compile(r"/expire/(\d{10})/", re.IGNORECASE),
-    re.compile(r"[?&]exp=(\d{10})", re.IGNORECASE),
+    # hdnea/Akamai-подобные токены: "...~exp=1234567890~acl=*" — разделитель "~".
+    # Без этого варианта истёкший токен не распознавался, TTL считался заново,
+    # и ссылка уходила в probe уже мёртвой (наблюдали на Euronews).
+    re.compile(r"[?&~]exp=(\d{10})", re.IGNORECASE),
 )
 
-_EXPIRY_SAFETY_MARGIN = 30
+_EXPIRY_SAFETY_MARGIN = 75
 
 DEFAULT_TTL_BY_METHOD = {
     "direct": IPTV_CACHE_TTL,
@@ -85,62 +89,21 @@ def _extract_url_expiry(url: str) -> int | None:
     return None
 
 
-def _parse_cache_control_ttl(cache_control: str, default_ttl: int) -> int:
-    if not cache_control:
-        return default_ttl
-    directives = [d.strip() for d in cache_control.lower().split(",")]
-    if "no-store" in directives:
-        return _TTL_NO_STORE
-    if "no-cache" in directives:
-        return _TTL_NO_CACHE
-    smaxage = None
-    maxage = None
-    for d in directives:
-        if d.startswith("s-maxage="):
-            try:
-                smaxage = int(d.split("=", 1)[1])
-            except ValueError:
-                pass
-        elif d.startswith("max-age="):
-            try:
-                maxage = int(d.split("=", 1)[1])
-            except ValueError:
-                pass
-    if smaxage is not None:
-        return min(max(smaxage, _MIN_CDN_TTL), default_ttl)
-    if maxage is not None:
-        return min(max(maxage, _MIN_CDN_TTL), default_ttl)
-    if "must-revalidate" in directives:
-        return _TTL_MUST_REVALIDATE
-    return default_ttl
+def _compute_cache_expire(payload: str, method: str) -> float:
+    """Сколько держать payload в кэше — по сроку жизни ССЫЛКИ (ttl-url-lifetime-v1).
 
+    Cache-Control/CDN-заголовки для этого не годятся: живые HLS-плейлисты сплошь
+    отдаются с `no-store`/`max-age=1` (плейлист меняется каждые несколько секунд),
+    из-за чего рабочие ссылки выбрасывались каждые 30 с и канал уходил в вечный
+    перерезолв (наблюдали на трёх каналах: ссылки без подписи, TTL 29–30 с).
 
-def _fetch_cache_control(clean_url: str, headers: dict, timeout: int = 2) -> str:
-    req_headers = {"User-Agent": headers.get("User-Agent", IPTV_DEFAULT_UA)}
-    if headers.get("Referer"):
-        req_headers["Referer"] = headers["Referer"]
-    if headers.get("Cookie"):
-        req_headers["Cookie"] = headers["Cookie"]
-    try:
-        req = urllib.request.Request(clean_url, method="HEAD", headers=req_headers)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.headers.get("Cache-Control", "") or ""
-    except urllib.error.HTTPError as e:
-        if e.code not in (405, 501):
-            return ""
-    except Exception:
-        return ""
-    try:
-        get_headers = dict(req_headers)
-        get_headers["Range"] = "bytes=0-0"
-        req = urllib.request.Request(clean_url, headers=get_headers)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.headers.get("Cache-Control", "") or ""
-    except Exception:
-        return ""
-
-
-def _compute_cache_expire(payload: str, method: str, cache_control: str | None = None) -> float:
+    Правило:
+      * есть `exp` в URL → срок известен, берём его минус запас;
+      * сессионные URL (wmsauthsign, PHPSESSID, token=…) → короткий TTL;
+      * иначе → дефолт метода.
+    Реальные смерти ловят проба перед записью, измеренный срок жизни
+    (healthcheck_worker._note_payload_death) и stale-gate на 403/404 в муксе.
+    """
     default_ttl = DEFAULT_TTL_BY_METHOD.get(method, 600)
     if not payload:
         return time.time() + default_ttl
@@ -150,7 +113,7 @@ def _compute_cache_expire(payload: str, method: str, cache_control: str | None =
             if line and not line.startswith("#"):
                 payload = line
                 break
-    clean_url, headers = parse_url_headers(payload)
+    clean_url, _ = parse_url_headers(payload)
     if not clean_url.startswith("http"):
         return time.time() + default_ttl
     url_exp = _extract_url_expiry(clean_url)
@@ -159,26 +122,8 @@ def _compute_cache_expire(payload: str, method: str, cache_control: str | None =
         if left <= 0:
             return time.time() + 5
         return time.time() + int(left)
-    if cache_control is not None:
-        cap = _SNIFFER_HEAD_CAP if method == "sniffer" else default_ttl
-        ttl = _parse_cache_control_ttl(cache_control, cap)
-        if method == "sniffer" and ttl < _SNIFFER_NO_INFO_TTL:
-            clean_url, _ = parse_url_headers(payload)
-            if _extract_url_expiry(clean_url) is None and not _is_session_url(clean_url):
-                ttl = _SNIFFER_NO_INFO_TTL
-        return time.time() + ttl
     if _is_session_url(clean_url):
-        cc = _fetch_cache_control(clean_url, headers, timeout=2)
-        if cc:
-            return time.time() + _parse_cache_control_ttl(cc, _SESSION_TTL_CAP)
         return time.time() + _SESSION_TTL_CAP
-    if method != "direct":
-        cc = _fetch_cache_control(clean_url, headers, timeout=2)
-        if cc:
-            return time.time() + _parse_cache_control_ttl(cc, default_ttl)
-        if method == "sniffer":
-            return time.time() + _SNIFFER_NO_INFO_TTL
-        return time.time() + default_ttl
     return time.time() + default_ttl
 
 
@@ -195,3 +140,128 @@ def _is_ad_url(url: str) -> bool:
         return False
     low = url.lower()
     return any(m in low for m in _AD_URL_MARKERS)
+
+
+# ---------- Общие правила: что реально играет и жив ли хост ----------
+_VARIANT_BW_RE = re.compile(r"BANDWIDTH=(\d+)", re.IGNORECASE)
+_MEDIA_URI_RE = re.compile(r'URI="([^"]+)"', re.IGNORECASE)
+
+
+def select_playable(text: str, base_url: str) -> dict:
+    """Из текста манифеста — то, что реально пойдёт в плеер.
+
+    Медиа-плейлист:  {"kind": "media",  "video": base_url, "audio": None}
+    Master:          {"kind": "master", "video": <вариант с max BANDWIDTH>,
+                                         "audio": <URI аудио-группы|None>}
+
+    Одно место для правила на весь проект: мукс, проба и сниффер спрашивают
+    здесь вместо того, чтобы парсить master каждый по-своему.
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines()]
+    if not any(ln.startswith("#EXT-X-STREAM-INF") for ln in lines):
+        return {"kind": "media", "video": base_url, "audio": None}
+    audio = None
+    best_bw, best_url = -1, None
+    for i, ln in enumerate(lines):
+        if ln.startswith("#EXT-X-MEDIA") and "TYPE=AUDIO" in ln.upper():
+            if audio is None:
+                m = _MEDIA_URI_RE.search(ln)
+                if m:
+                    audio = urllib.parse.urljoin(base_url, m.group(1))
+        elif ln.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
+            nxt = lines[i + 1]
+            if nxt and not nxt.startswith("#"):
+                m = _VARIANT_BW_RE.search(ln)
+                bw = int(m.group(1)) if m else 0
+                if bw > best_bw:
+                    best_bw, best_url = bw, urllib.parse.urljoin(base_url, nxt)
+    return {"kind": "master", "video": best_url, "audio": audio}
+
+
+def probe_stream_types(url: str, ua: str = None, referer: str = None,
+                       cookie: str = None, timeout: int = 8) -> set:
+    """Какие дорожки реально несёт плейлист: {"video"}, {"audio"}, оба или пусто.
+
+    Нужен там, где по имени файла или по объявленным CODECS судить нельзя:
+    у части CDN объявленный в master'е аудио-кодек не означает, что аудио есть
+    в самом варианте, и наоборот.
+    """
+    clean, _ = parse_url_headers(url or "")
+    if not clean.startswith("http"):
+        return set()
+    cmd = ["ffprobe", "-v", "error", "-analyzeduration", "3000000",
+           "-probesize", "1500000", "-show_entries", "stream=codec_type",
+           "-of", "csv=p=0"]
+    hdr = ""
+    if referer:
+        hdr += f"Referer: {referer}\r\n"
+    if cookie:
+        hdr += f"Cookie: {cookie}\r\n"
+    if hdr:
+        cmd += ["-headers", hdr]
+    cmd += ["-user_agent", ua or IPTV_DEFAULT_UA, clean]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return set()
+    types = set()
+    for line in ((res.stdout or "") + "\n" + (res.stderr or "")).splitlines():
+        low = line.strip().lower()
+        if not low:
+            continue
+        if low.startswith("video") or ",video" in low:
+            types.add("video")
+        if low.startswith("audio") or ",audio" in low:
+            types.add("audio")
+    return types
+
+
+def fetch_manifest_text(url: str, ua: str = None, referer: str = None,
+                        cookie: str = None, timeout: int = 3) -> str:
+    """Тянет плейлист и возвращает его текст ("" если это не плейлист).
+
+    Дешёвая проверка «этот плейлист вообще жив»: 403/404/пустой ответ → "".
+    Двоичные ответы (сегменты видео/аудио) отбрасываем по content-type, чтобы
+    не тянуть мегабайты впустую.
+    """
+    clean, _ = parse_url_headers(url or "")
+    if not clean.startswith("http"):
+        return ""
+    headers = {"User-Agent": ua or IPTV_DEFAULT_UA}
+    if referer:
+        headers["Referer"] = referer
+    if cookie:
+        headers["Cookie"] = cookie
+    try:
+        req = urllib.request.Request(clean, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if ctype.startswith(("video/", "audio/", "image/", "font/")):
+                return ""
+            raw = resp.read(300000)
+            if resp.headers.get("Content-Encoding") == "gzip":
+                import gzip
+                raw = gzip.decompress(raw)
+        return raw.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def tcp_reachable(url: str, timeout: float = 3.0) -> bool:
+    """Жив ли хост вообще (TCP-коннект) — вместо 45-секундного ожидания ffprobe
+    на мёртвом адресе. True также когда проверка неприменима: тогда решение
+    остаётся за ffprobe.
+    """
+    try:
+        clean, _ = parse_url_headers(url or "")
+        parts = urllib.parse.urlsplit(clean)
+    except Exception:
+        return True
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return True
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    try:
+        with socket.create_connection((parts.hostname, port), timeout=timeout):
+            return True
+    except Exception:
+        return False

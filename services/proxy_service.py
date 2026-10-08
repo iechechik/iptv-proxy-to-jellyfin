@@ -1,4 +1,6 @@
 import re
+import threading
+import time
 import urllib.request
 from urllib.parse import quote, urljoin
 from typing import Optional
@@ -7,7 +9,69 @@ from fastapi.responses import RedirectResponse
 import gzip
 
 from core.config import logger, IPTV_MANAGE_URL, IPTV_DEFAULT_UA, IPTV_FETCH_TIMEOUT, IPTV_FLARESOLVERR_URL
+import core.state as state
 from services.resolver import parse_url_headers
+
+# ---------------------------------------------------------------------------
+# stale-gate-v1: реакция на «CDN отверг подписанную ссылку»
+#
+# Подписанные ссылки (Dailymotion sec=, Akamai hdnea=) живут минуты и протухают
+# БЕЗ отражения этого в кэше: cache_expire ещё не наступил, а ссылка уже 403.
+# Раньше в этом случае /mux отдавал 404, Jellyfin ретраил мгновенно — в логе
+# получались сотни запросов по мёртвой ссылке (и вечный логотип у клиента).
+#
+# Теперь: слот кэша чистим, канал заказываем на переразбор, а клиенту отвечаем
+# 503 + Retry-After, пока идёт переразбор (то же отдаёт и /redirect).
+# ---------------------------------------------------------------------------
+_gate_lock = threading.Lock()
+_gate_until = {}           # channel -> timestamp, до которого отвечаем 503
+_GATE_DEAD_SEC = 35.0     # ссылка мертва (401/403/404): ждём переразбор целиком
+_GATE_ERROR_SEC = 3.0     # прочие ошибки CDN: короткая пауза, кэш не чистим
+
+
+def stale_gate_remaining(name: str) -> float:
+    """Сколько секунд ещё отвечать 503 для канала (0 — гейт не активен)."""
+    if not name:
+        return 0.0
+    with _gate_lock:
+        until = _gate_until.get(name, 0.0)
+    return max(0.0, until - time.time())
+
+
+def enter_stale_gate(name: str, seconds: float) -> None:
+    if not name:
+        return
+    with _gate_lock:
+        _gate_until[name] = max(_gate_until.get(name, 0.0), time.time() + seconds)
+
+
+def mark_payload_dead(name: str) -> None:
+    """Ссылка активного слота мертва: чистим слот и заказываем переразбор канала."""
+    enter_stale_gate(name, _GATE_DEAD_SEC)
+    try:
+        state.clear_stream_cache(name, state.get_active_index(name))
+    except Exception as e:
+        logger.warning(f"[STALE] '{name}': clear slot failed: {e}")
+    try:
+        from services.healthcheck import revalidate_channel_in_background
+        ch = state.get_channel(name)
+        if ch:
+            revalidate_channel_in_background(ch)
+            logger.warning(f"[STALE] '{name}': payload invalidated, re-resolve queued")
+    except Exception as e:
+        logger.warning(f"[STALE] '{name}': re-resolve trigger failed: {e}")
+
+
+def mark_cdn_error(name: str) -> None:
+    """CDN не ответил (таймаут/5xx): кэш не трогаем, только короткая пауза."""
+    enter_stale_gate(name, _GATE_ERROR_SEC)
+
+
+# Кэш вердикта needs_mux: без него каждый ретрай клиента делал ещё один
+# HTTP-запрос за master'ом.
+_needs_mux_cache = {}
+_NEEDS_MUX_TTL = 60.0
+_NEEDS_MUX_ERR_TTL = 30.0
 
 def read_response_text(resp):
     """Читает тело HTTP-ответа, при необходимости распаковывая gzip."""
@@ -18,15 +82,33 @@ def read_response_text(resp):
 
 def needs_mux(payload: str, channel_name: str = None) -> bool:
     tag = channel_name or "?"
+
+    # needs-mux-cache-v1: вердикт по этому payload кэшируем, иначе каждый ретрай
+    # клиента делает лишний HTTP-запрос за master'ом.
+    _key = (channel_name, payload[:200], len(payload))
+    _now = time.time()
+    _hit = _needs_mux_cache.get(_key)
+    if _hit and _hit[1] > _now:
+        return bool(_hit[0])
+
+    def _remember(value: bool, ttl: float) -> bool:
+        _needs_mux_cache[_key] = (bool(value), time.time() + ttl)
+        if len(_needs_mux_cache) > 256:
+            _cut = time.time()
+            for _k, _v in list(_needs_mux_cache.items()):
+                if _v[1] <= _cut:
+                    _needs_mux_cache.pop(_k, None)
+        return bool(value)
+
     if payload.startswith("#EXTM3U"):
         result = "#EXT-X-MEDIA:TYPE=AUDIO" in payload
         logger.info(f"[MUX] '{tag}': synthetic payload, result={result}")
-        return result
+        return _remember(result, _NEEDS_MUX_TTL)
 
     clean_url, headers_dict = parse_url_headers(payload)
     if ".m3u8" not in clean_url.lower():
         logger.info(f"[MUX] '{tag}': not .m3u8, result=False")
-        return False
+        return _remember(False, _NEEDS_MUX_TTL)
 
     try:
         headers = {"User-Agent": headers_dict.get("User-Agent", IPTV_DEFAULT_UA)}
@@ -49,13 +131,14 @@ def needs_mux(payload: str, channel_name: str = None) -> bool:
             f"starts_with_EXTM3U={content.lstrip().startswith('#EXTM3U')}, "
             f"has_AUDIO={has_audio}, head={head!r}"
         )
-        return has_audio
+        return _remember(has_audio, _NEEDS_MUX_TTL)
     except Exception as e:
         if channel_name:
             logger.warning(f"[MUX] '{channel_name}': master playlist check failed: {e}")
         else:
             logger.warning(f"[MUX] master playlist check failed: {e}")
-        return True
+        # fail-safe остаётся: не смогли проверить — считаем, что mux нужен.
+        return _remember(True, _NEEDS_MUX_ERR_TTL)
 
 def _proxy_googlevideo_manifest(payload: str, client_ua: str) -> Optional[Response]:
     clean_url, _ = parse_url_headers(payload)

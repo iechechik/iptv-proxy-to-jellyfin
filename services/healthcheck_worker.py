@@ -47,6 +47,81 @@ def _probe_with_semaphore(payload: str, name: str) -> dict:
         return probe_stream(payload, timeout=15, channel=name)
 
 
+# ---------------------------------------------------------------------------
+# re-resolve-v1: как долго реально живёт payload канала.
+#
+# Значения по умолчанию (IPTV_CACHE_TTL/FAST) рассчитаны на «ссылку вообще», а
+# подписанные ссылки у части CDN живут минуты. Точный срок в URL есть не всегда,
+# поэтому измеряем его сами: когда payload, который был в слоте, перестал быть
+# живым, его возраст = наблюдённый срок жизни. Дальше проверяем раньше этой
+# границы (0.7 от минимума), чтобы не попадать в смерть, а не констатировать её.
+# ---------------------------------------------------------------------------
+_LIFETIME_SAMPLES = 3
+_LIFETIME_FLOOR = 60          # ниже не опускаемся даже для самых коротких
+_LIFETIME_MARGIN = 0.7
+# Какую долю остатка жизни ссылки используем как интервал: 0.75 = обновляем
+# заранее, с запасом 25% (раньше обновляли в 1.0 — «в притирку» к смерти).
+_RENEW_AT_OF_TTL = 0.75
+_observed_lifetimes = {}      # name -> [sек, ...] (последние наблюдённые)
+
+
+def _note_payload_death(name: str, alive_sec: float):
+    """Запомнить, сколько прожил payload канала (вызывается на его смерти)."""
+    try:
+        alive_sec = float(alive_sec)
+    except (TypeError, ValueError):
+        return
+    if not (5 < alive_sec < IPTV_CACHE_TTL * 4):
+        return
+    samples = _observed_lifetimes.setdefault(name, [])
+    samples.append(alive_sec)
+    del samples[:-_LIFETIME_SAMPLES]
+    logger.info(f"[RESOLVE] '{name}': payload жил {int(alive_sec)} с — интервал проверок "
+                f"подстраиваем под это")
+
+
+def _apply_observed_lifetime(name: str, base: float) -> float:
+    """Уменьшить интервал проверки, если payload'ы этого канала живут меньше TTL."""
+    samples = _observed_lifetimes.get(name)
+    if not samples:
+        return base
+    return max(_LIFETIME_FLOOR, min(base, int(min(samples) * _LIFETIME_MARGIN)))
+
+
+def _payload_age(name: str, index: int) -> float:
+    """Сколько секунд назад в слот положили текущий payload (0, если неизвестно)."""
+    try:
+        with state.cache_lock:
+            entry = state._epg_cache.get(name, {})
+            streams = entry.get("streams_cache", []) if isinstance(entry, dict) else []
+            slot = streams[index] if 0 <= index < len(streams) else {}
+        set_at = slot.get("cache_set") if isinstance(slot, dict) else None
+        if not set_at:
+            return 0.0
+        return max(0.0, time.time() - float(set_at))
+    except Exception:
+        return 0.0
+
+
+def _earliest_payload_expire(name: str) -> float:
+    """Ближайший срок жизни среди payload'ов канала (0 — payload'ов нет).
+
+    Важно смотреть ВСЕ потоки канала, а не только активный: у канала без
+    активного потока срок активного = 0, и проверка ставилась по cache_ttl
+    (час), из-за чего ссылка с TTL 3 минуты протухала заведомо.
+    """
+    try:
+        with state.cache_lock:
+            entry = state._epg_cache.get(name, {})
+            streams = entry.get("streams_cache", []) if isinstance(entry, dict) else []
+            exp = [float(s.get("cache_expire") or 0) for s in streams
+                   if isinstance(s, dict) and s.get("cached_stream")]
+        exp = [e for e in exp if e > 0]
+        return min(exp) if exp else 0.0
+    except Exception:
+        return 0.0
+
+
 def _process_channel_check(name: str, ch: dict, task_id: str = None,
                             reason: str = REASON_SCHEDULED, force: bool = False):
     """Одна задача = один канал.
@@ -271,6 +346,7 @@ def _check_stream_with_cache(name: str, stream: dict, index: int, use_probe: boo
 
     # --- Payload: кэш или резолв ---
     cached = state.get_stream_cache(name, s_idx)
+    used_cache = bool(cached)
     if cached:
         is_direct, payload, expire_time = cached
         method = stream.get("resolver", "auto")
@@ -310,6 +386,10 @@ def _check_stream_with_cache(name: str, stream: dict, index: int, use_probe: boo
         except Exception as e:
             probe = {"ok": False, "detail": f"ffprobe raised: {e}"}
         if not probe.get("ok"):
+            # re-resolve-v1: payload был в слоте и оказался мёртвым — это и есть
+            # измерение его срока жизни (см. _note_payload_death).
+            if used_cache:
+                _note_payload_death(name, _payload_age(name, s_idx))
             return {
                 "success": False,
                 "detail": f"Probe failed: {probe.get('detail', 'no detail')}",
@@ -329,6 +409,8 @@ def _check_stream_with_cache(name: str, stream: dict, index: int, use_probe: boo
         except Exception:
             ok = False
         if not ok:
+            if used_cache:
+                _note_payload_death(name, _payload_age(name, s_idx))
             return {
                 "success": False,
                 "detail": "HEAD failed",
@@ -428,14 +510,31 @@ def _select_best_stream(candidates: list, active_index: int):
 
 
 def _schedule_next(name: str, success: bool):
-    """Ставит next_check_at[name] с учётом TTL и min_interval."""
+    """Ставит next_check_at[name] с учётом TTL и min_interval.
+
+    Интервал считается от САМОЙ КОРОТКОЙ ссылки канала и обновляется ЗАРАНЕЕ
+    (см. _RENEW_AT_OF_TTL), а не в момент её смерти: иначе любой сбой резолва
+    оставляет канал без payload'а ровно тогда, когда клиент его просит.
+    """
     base = IPTV_CACHE_TTL if success else IPTV_FAST_CACHE_TTL
     s_state = state.get_active_stream_state(name)
-    cached_expire = s_state.get("cache_expire", 0)
-    if cached_expire > time.time():
-        ttl_left = cached_expire - time.time()
-        base = min(base, ttl_left)
-    base = max(int(base), IPTV_HEALTHCHECK_MIN_INTERVAL)
+    earliest = _earliest_payload_expire(name) or s_state.get("cache_expire", 0)
+    ttl_left = earliest - time.time()
+    floor = IPTV_HEALTHCHECK_MIN_INTERVAL
+    if ttl_left > 0:
+        renew_at = max(_LIFETIME_FLOOR // 2, int(ttl_left * _RENEW_AT_OF_TTL))
+        base = min(base, renew_at)
+        # min_interval не должен быть длиннее остатка жизни ссылки, иначе payload
+        # протухает между проверками (наблюдали: ссылки 30–240 с при min_interval 300)
+        floor = min(floor, renew_at)
+    elif earliest > 0 and success:
+        # payload'ы уже протухли — обновляем при первой возможности
+        base = min(base, IPTV_HEALTHCHECK_MIN_INTERVAL // 2)
+        floor = _LIFETIME_FLOOR
+    base = _apply_observed_lifetime(name, base)
+    base = max(int(base), floor)
+    logger.info(f"[HEALTHCHECK] '{name}': следующий разбор через {int(base)} с "
+                f"(остаток ссылки {int(ttl_left) if earliest else 0} с, success={success})")
     with state._healthcheck_lock:
         _next_check_at[name] = time.time() + base
 

@@ -622,6 +622,10 @@ def set_stream_cache(name: str, index: int, payload: str, is_direct: bool, expir
             s.pop("needs_mux", None)
 
         now = time.time()
+        if old_payload != payload:
+            # re-resolve-v1: возраст payload'а считается от момента, когда он
+            # появился в слоте (повторная запись того же payload не сбрасывает).
+            s["cache_set"] = now
         s["cached_stream"] = payload
         s["cache_is_direct"] = is_direct
         s["cache_expire"] = expire_time
