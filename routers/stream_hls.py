@@ -10,7 +10,7 @@ import re
 import time
 import urllib.request
 import urllib.error
-from urllib.parse import unquote, urljoin
+from urllib.parse import urljoin
 
 import core.state as state
 from core.config import IPTV_DEFAULT_UA, IPTV_FETCH_TIMEOUT, logger
@@ -105,10 +105,36 @@ def proxy_hls_manifest(url: str, request: Request, referer: str = None, cookie: 
             headers["Cookie"] = cookie
 
         req = urllib.request.Request(target_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=IPTV_FETCH_TIMEOUT) as resp:
-            final_url = resp.geturl()
-            content_type = resp.headers.get("Content-Type", "") or ""
-            raw = resp.read()
+        # manifest-retry-v1: сетевые сбои и 5xx повторяем (3 попытки); 4xx — мёртвая сессия, повторов нет.
+        raw = None
+        _last_err = None
+        for _attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=IPTV_FETCH_TIMEOUT) as resp:
+                    final_url = resp.geturl()
+                    content_type = resp.headers.get("Content-Type", "") or ""
+                    raw = resp.read()
+                _last_err = None
+                break
+            except urllib.error.HTTPError as _he:
+                _last_err = _he
+                if _he.code in (401, 403, 404, 410):
+                    if channel:
+                        try:
+                            from services.proxy_service import mark_payload_dead
+                            mark_payload_dead(channel)
+                            logger.warning(f"[HLS-PROXY] [{channel}]: манифест {_he.code} → ссылка помечена мёртвой, нужен перерезолв")
+                        except Exception as _me:
+                            logger.warning(f"[HLS-PROXY] [{channel}]: mark_payload_dead failed: {_me}")
+                    break
+                if _he.code < 500:
+                    break
+                time.sleep(0.4 * (_attempt + 1))
+            except Exception as _ue:
+                _last_err = _ue
+                time.sleep(0.4 * (_attempt + 1))
+        if raw is None:
+            raise _last_err
 
         # Fast path: апстрим вернул бинарный TS-сегмент вместо манифеста.
         # Jellyfin иногда просит .ts через manifest-эндпоинт (своя логика
@@ -150,7 +176,15 @@ def proxy_hls_manifest(url: str, request: Request, referer: str = None, cookie: 
                         f"(ct={content_type!r}, len={len(content)}, "
                         f"head={content[:100]!r}) target_url={target_url}"
                     )
-                    return Response("Invalid HLS manifest", status_code=502)
+                    # manifest-degrade-v1: вместо текстовой ошибки (Jellyfin читает её как «End of file») отдаём живой чёрный плейлист — канал вернётся сам.
+                    if channel:
+                        try:
+                            from services.proxy_service import mark_payload_dead
+                            mark_payload_dead(channel)
+                            logger.warning(f"[HLS-PROXY] [{channel}]: источник отдал не-HLS → ссылка помечена мёртвой")
+                        except Exception:
+                            pass
+                    return _black_live_playlist()
 
             else:
                 logger.warning(
@@ -158,7 +192,14 @@ def proxy_hls_manifest(url: str, request: Request, referer: str = None, cookie: 
                     f"(ct={content_type!r}, len={len(content)}, "
                     f"head={content[:100]!r}) target_url={target_url}"
                 )
-                return Response("Not an HLS manifest", status_code=502)
+                if channel:
+                    try:
+                        from services.proxy_service import mark_payload_dead
+                        mark_payload_dead(channel)
+                        logger.warning(f"[HLS-PROXY] [{channel}]: источник отдал не-HLS → ссылка помечена мёртвой")
+                    except Exception:
+                        pass
+                return _black_live_playlist()
 
         _no_prefetch = request.query_params.get("no_prefetch") == "1" if request else False
         _prefetch_allowed = False
@@ -186,11 +227,11 @@ def proxy_hls_manifest(url: str, request: Request, referer: str = None, cookie: 
             if segment_urls:
                 segment_urls = segment_urls[-IPTV_PREFETCH_MAX_SEGMENTS:]
             if segment_urls and _prefetch_allowed:
-                _pf_headers = {"User-Agent": unquote(ua) if ua else IPTV_DEFAULT_UA}
+                _pf_headers = {"User-Agent": ua or IPTV_DEFAULT_UA}
                 if referer:
-                    _pf_headers["Referer"] = unquote(referer)
+                    _pf_headers["Referer"] = referer
                 if cookie:
-                    _pf_headers["Cookie"] = unquote(cookie)
+                    _pf_headers["Cookie"] = cookie
                 schedule_prefetch(segment_urls, _pf_headers, channel=channel)
         except Exception as _e:
             logger.warning(f"[PREFETCH] schedule failed: {_e}")
@@ -220,10 +261,40 @@ def proxy_hls_manifest(url: str, request: Request, referer: str = None, cookie: 
         )
     except urllib.error.HTTPError as e:
         logger.error(f"[HLS-PROXY] [{channel or '?'}] HTTP {e.code}: {e.reason} (url={url[:120]})")
-        return Response(f"Error fetching manifest: {e.code} {e.reason}", status_code=502)
+        # manifest-degrade-v1: Jellyfin читает текстовую ошибку как «End of file»
+        # и роняет канал. Отдаём живой чёрный плейлист — канал не падает и
+        # вернётся сам, когда источник/перерезолв дадут рабочий манифест.
+        return _black_live_playlist()
     except Exception as e:
         logger.error(f"[HLS-PROXY] [{channel or '?'}] proxying failed ({url[:120]}): {e}")
-        return Response(f"Error proxying playlist: {e}", status_code=502)
+        return _black_live_playlist()
+
+
+def _black_live_playlist() -> Response:
+    """Живой «чёрный» плейлист для деградации вместо ошибки.
+
+    Текстовую ошибку (502) Jellyfin показывает как «End of file» и роняет
+    канал, после чего перезапускается по кругу. Вместо этого отдаём валидный
+    живой плейлист из чёрных сегментов с растущим MEDIA-SEQUENCE: плеер
+    считает поток живым и продолжает перечитывать плейлист. Как только наш
+    upstream оживёт (или перерезолв найдёт рабочую ссылку), клиент получит
+    настоящий плейлист — канал вернётся сам, без действий пользователя.
+    """
+    seq = int(time.time()) // 6
+    body = (
+        "#EXTM3U\n"
+        "#EXT-X-VERSION:3\n"
+        "#EXT-X-TARGETDURATION:6\n"
+        f"#EXT-X-MEDIA-SEQUENCE:{seq}\n"
+        "#EXTINF:6.0,\n"
+        f"/black.ts?seq={seq}\n"
+    )
+    return Response(
+        content=body,
+        media_type="application/vnd.apple.mpegurl",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate",
+                 "Pragma": "no-cache", "Expires": "0"},
+    )
 
 
 # hls-ext-paths-v1
@@ -324,11 +395,12 @@ def proxy_hls_segment(
         except Exception as e:
             logger.warning(f"[PREFETCH] cache read error: {e}")
 
-        headers = {"User-Agent": unquote(ua) if ua else IPTV_DEFAULT_UA}
+        # no-double-unquote-v1: FastAPI уже декодировал query — повторный unquote портит '+' в cookie и CDN отвечает 403.
+        headers = {"User-Agent": ua or IPTV_DEFAULT_UA}
         if referer:
-            headers["Referer"] = unquote(referer)
+            headers["Referer"] = referer
         if cookie:
-            headers["Cookie"] = unquote(cookie)
+            headers["Cookie"] = cookie
 
         client_range = request.headers.get("range") if request else None
         if client_range:
@@ -379,12 +451,16 @@ def proxy_hls_segment(
                     else:
                         raise
         except urllib.error.HTTPError as e:
-            # remove-flare-from-segments-v1:
-            # FlareSolverr убран из прокси сегментов/ключей. Он возвращает
-            # solution.response как UTF-8 строку — бинарные TS и ключи
-            # портятся. Плюс запускает Chromium на каждый сегмент.
-            # Уместен только в резолвере (поиск m3u8 на HTML-странице).
+            # remove-flare-from-segments-v1: FlareSolverr неприменим к сегментам и ключам — он портит бинарные данные и стартует Chromium на каждый сегмент.
             logger.error(f"[TS-PROXY] [{channel or '?'}] HTTP {e.code}: {target_url[:120]}")
+            # proxy-4xx-revalidate-v1: 401/403/404 на сегменте = умерла сессия → сразу метим ссылку мёртвой, без ожидания планового разбора.
+            if e.code in (401, 403, 404) and channel:
+                try:
+                    from services.proxy_service import mark_payload_dead
+                    mark_payload_dead(channel)
+                    logger.warning(f"[TS-PROXY] [{channel}]: сегмент {e.code} → ссылка помечена мёртвой, нужен перерезолв")
+                except Exception as _me:
+                    logger.warning(f"[TS-PROXY] [{channel}]: mark_payload_dead failed: {_me}")
             return Response(f"Upstream error: {e.code}", status_code=502)
         except Exception as e:
             logger.error(f"[TS-PROXY] [{channel or '?'}] {type(e).__name__}: {e} ({target_url[:120]})")

@@ -1,4 +1,5 @@
 import subprocess
+import os
 import threading
 import asyncio
 import time
@@ -54,6 +55,66 @@ def _warm_input(name, url, label, ua, referer=None, cookie=None, attempts=3, wai
     return False
 
 
+def _is_fmp4_video(url, ua, headers_str=None, timeout=6.0) -> bool:
+    """fMP4/AVCC-источник или обычный Annex-B TS — по СЕГМЕНТАМ плейлиста.
+
+    Нужно, чтобы не ставить `-bsf:v dump_extra` на fMP4: фильтр ожидает Annex-B и
+    падает на смене параметров на границе сегмента («Error applying bitstream
+    filters to an output packet … Invalid data found»), убивая мукс. Замер: без
+    фильтра параметры кадра в выходе всё равно повторяются (SPS/PPS по 3 раза на
+    2,4 МБ) — их вставляет упаковщик MPEG-TS при конвертации AVCC→Annex-B.
+    """
+    if not url:
+        return False
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": ua or "Mozilla/5.0"})
+        if headers_str:
+            for part in headers_str.split("\r\n"):
+                if ":" in part:
+                    k, v = part.split(":", 1)
+                    req.add_header(k.strip(), v.strip())
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            txt = resp.read(200000).decode("utf-8", "ignore")
+    except Exception:
+        return False
+    if "#EXT-X-MAP" in txt:
+        return True
+    exts = {l.strip().split("?")[0].rsplit(".", 1)[-1].lower()
+            for l in txt.splitlines() if l.strip() and not l.strip().startswith("#")}
+    return bool(exts & {"m4s", "mp4", "m4v", "m4a"})
+
+
+def _audio_ready(name, url, ua, headers_str=None, attempts=3, timeout=4.0, wait=2.0) -> bool:
+    """Есть ли в потоке аудиодорожка — до старта двухвходового мукса.
+
+    Прогрев (_warm_input) доказывает только наличие сегментов в плейлисте, но не
+    наличие аудиопотока. Если стартовать раньше, ffmpeg фиксирует `-map 1:a:0?`
+    как «дорожки нет» и ВЕСЬ сеанс идёт без звука: у клиента картинка без звука,
+    и только следующий запуск (когда вход уже прогрет) играет нормально.
+    """
+    if not url:
+        return False
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "a",
+           "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+           "-user_agent", ua or "Mozilla/5.0"]
+    if headers_str:
+        cmd += ["-headers", headers_str]
+    cmd.append(url)
+    for i in range(1, attempts + 1):
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=timeout, text=True)
+            if "audio" in (r.stdout or ""):
+                if i > 1:
+                    logger.info(f"[MUX] '{name}': аудиодорожка появилась с попытки {i}")
+                return True
+            logger.info(f"[MUX] '{name}': аудиодорожки пока нет (попытка {i}/{attempts})")
+        except Exception as e:
+            logger.info(f"[MUX] '{name}': проверка аудио, попытка {i}/{attempts}: {e}")
+        if i < attempts:
+            time.sleep(wait)
+    return False
+
+
 # Если из stdout ffmpeg давно нет данных, а процесс жив —
 # считаем его зависшим на мёртвом источнике и убиваем.
 _MUX_STALL_TIMEOUT = 60
@@ -64,6 +125,9 @@ _MUX_START_GRACE = 120
 # Рейтлимит для лога "subscriber queue FULL": в шторме в секунду
 # прилетало по сотне строк, что само по себе создаёт нагрузку.
 _QUEUE_FULL_LOG_INTERVAL = 1.0
+
+# mux-gop-seed-v1: отдавать новому зрителю затравку (SPS/PPS + данные от IDR) — без неё клиент входит в середину GOP и не находит ключевой кадр. Отладка: IPTV_MUX_GOP_SEED=0.
+_GOP_SEED_ENABLED = os.environ.get("IPTV_MUX_GOP_SEED", "1") not in ("0", "", "no", "false")
 
 
 # mux-reuse-base-url-v1
@@ -126,19 +190,7 @@ class MuxProcess:
         if cookie:
             headers_str += f"Cookie: {cookie}\r\n"
 
-        # -thread_queue_size: дефолт (обычно 8) слишком мал для двух
-        # независимых живых сетевых входов, синхронизируемых на муксе —
-        # при малейшей заминке любого из них ловим "Thread message queue
-        # blocking" и визуально это выглядит как зависание/рассыпание.
-        # -reconnect*: не даёт ffmpeg встать колом при кратковременном
-        # обрыве HTTP-соединения на любом из входов.
-        # -timeout: верхняя граница ожидания на коннект/TLS-рукопожатие/
-        # чтение (микросекунды). Без него зависшее на рукопожатии
-        # соединение не считается оборванным вообще — reconnect выше
-        # просто не наступает, ffmpeg ждёт бесконечно.
-        # mux-timeouts-v1: -rw_timeout — если CDN молчит > 10 сек,
-        # ffmpeg переподключается. Иначе висит молча десятки секунд,
-        # /mux-стрим закрывается по empty_count, Jellyfin падает.
+        # mux-timeouts-v1: длинный -analyzeduration/-probesize, чтобы первый запуск двухвходового мукса не шёл без звука.
         reconnect_opts = [
             "-thread_queue_size", "4096",
             "-reconnect", "1",
@@ -151,6 +203,18 @@ class MuxProcess:
         # single-input-mux-v1: если audio_url пусто — ffmpeg читает только
         # video (в Pluto media уже есть A+V).
         single_input = not audio_url
+
+        # mux-avcc-no-bsf-v1: dump_extra ожидает Annex-B (TS). На fMP4/AVCC-источнике он
+        # падает при смене параметров кадра на границе сегмента и роняет мукс («Error
+        # applying bitstream filters to an output packet … Invalid data found», exit 183;
+        # наблюдалось перемежающееся падение, при этом ручной прогон той же команды в
+        # другой момент проходил). Параметры кадра не теряются: при упаковке в MPEG-TS
+        # их вставляет сам ffmpeg, конвертируя AVCC→Annex-B (замер: SPS/PPS повторяются
+        # у каждого ключевого кадра).
+        _fmp4 = _is_fmp4_video(video_url, ua, headers_str)
+        _bsf_args = [] if _fmp4 else ["-bsf:v", "dump_extra=freq=keyframe"]
+        if _fmp4:
+            logger.info(f"[MUX] '{name}': fMP4-источник — мукс без dump_extra")
 
         if headers_str:
             cmd += ["-headers", headers_str]
@@ -168,6 +232,7 @@ class MuxProcess:
             cmd += [
                 "-muxdelay", "0",
                 "-map", "0:v:0", "-map", "0:a:0?",
+                *_bsf_args,
                 "-c:v", "copy", "-c:a", "copy",
                 "-flush_packets", "1",
                 "-f", "mpegts", "pipe:1",
@@ -184,6 +249,7 @@ class MuxProcess:
                     "-user_agent", ua, "-i", audio_url,
                     "-muxdelay", "0",
                     "-map", "0:v:0", "-map", "1:a:0?",
+                    *_bsf_args,
                     "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
                     "-flush_packets", "1",
                     "-f", "mpegts", "pipe:1"]
@@ -192,6 +258,11 @@ class MuxProcess:
         _warm_input(name, video_url, "video", ua, referer, cookie)
         if not single_input:
             _warm_input(name, audio_url, "audio", ua, referer, cookie)
+            # mux-audio-ready-v1: дождаться аудиодорожки до старта, иначе первый зритель смотрит без звука (см. _audio_ready).
+            if not _audio_ready(name, audio_url, ua, headers_str):
+                logger.warning(
+                    f"[MUX] '{name}': аудиодорожка не появилась за ~8 с — стартуем видео-only"
+                )
 
         self.proc = subprocess.Popen(
             cmd,
@@ -216,6 +287,22 @@ class MuxProcess:
         # mux-input-death-v1: сколько раз вход ответил 4xx и признан ли он мёртвым
         self._http_error_count = 0
         self._input_dead = False
+        # mux-gop-cache-v1: кольцевой буфер последнего GOP — новый зритель стартует с ключевого кадра, а не из середины группы.
+        self._gop_lock = threading.Lock()
+        self._gop = bytearray()
+        self._params = b""
+        # Абсолютные смещения буфера в потоке: нужны, чтобы резать затравку по
+        # границе TS-пакета (188 байт), а не по произвольному байту.
+        self._abs_start = 0
+        self._abs_end = 0
+        self._gop_cap = 8 * 1024 * 1024
+        # Выровнен ли буфер по ключевому кадру (иначе затравку не отдаём).
+        self._gop_aligned = False
+        # Больше этого затравку не отдаём: 4 МБ с запасом покрывают
+        # прощупывание клиента (~1.5 МБ) и не заставляют плеер буферизовать
+        # десятки секунд старого потока.
+        self._seed_max = 4 * 1024 * 1024
+        self._gop_served = 0
         # Рейтлимит queue-FULL warning.
         self._queue_full_last_log = 0.0
         self._queue_full_dropped = 0
@@ -307,6 +394,88 @@ class MuxProcess:
         return_code = self.proc.wait()
         logger.error(f"[MUX] '{self.name}': ffmpeg exited with code {return_code}")
 
+    # Маркеры ключевого кадра H.264 (IDR) в Annex-B: 3- и 4-байтный старт-код.
+    _KF_MARKERS = (b"\x00\x00\x00\x01\x65", b"\x00\x00\x01\x65")
+    # mux-params-v1: резать буфер по IDR нельзя — SPS/PPS стоят ПЕРЕД ключевым
+    # кадром, и подписчик получил бы кадр без параметров («non-existing PPS 0»).
+    _SPS_MARKERS = (b"\x00\x00\x00\x01\x67", b"\x00\x00\x01\x67")
+    # Насколько далеко назад искать SPS от найденного ключевого кадра.
+    _params_scan_back = 65536
+
+    def _ingest_gop(self, chunk: bytes) -> None:
+        """Держим текущий GOP строго от ключевого кадра — для новых зрителей.
+
+        Затравка для нового подписчика — это данные ОТ КЛЮЧЕВОГО КАДРА вместе с
+        параметрами кадра (SPS/PPS), которые идут перед ним. Два условия
+        обязательны, оба проверены замерами на живом потоке:
+
+        * резать ровно по IDR нельзя — параметры кадра стоят ПЕРЕД ним, клиент
+          декодировал весь поток с «non-existing PPS 0» (230 ошибок против 1);
+        * резать по байту нельзя вообще — начало попадало в СЕРЕДИНУ
+          TS-пакета, и параметры кадра из этого пакета терялись при
+          демультиплексировании (клиент снова видел поток без SPS/PPS).
+          Поэтому границу выравниваем по 188 байтам, забирая целый пакет с SPS.
+        """
+        with self._gop_lock:
+            self._gop += chunk
+            self._abs_end += len(chunk)
+            kf = -1
+            for marker in self._KF_MARKERS:
+                pos = self._gop.rfind(marker)
+                if pos > kf:
+                    kf = pos
+            if kf > 0:
+                sps = -1
+                for marker in self._SPS_MARKERS:
+                    pos = self._gop.rfind(marker, max(0, kf - self._params_scan_back), kf)
+                    if pos > sps:
+                        sps = pos
+                if sps < 0:
+                    # параметров кадра перед ключевым кадром нет — выравнивать
+                    # нечего, затравку такому зрителю не отдаём (см. snapshot)
+                    self._gop_aligned = False
+                    return
+                anchor_abs = self._abs_start + sps
+                aligned_abs = anchor_abs - (anchor_abs % 188)
+                cut = aligned_abs - self._abs_start
+                if cut > 0:
+                    del self._gop[:cut]
+                    self._abs_start += cut
+                self._gop_aligned = True
+            elif len(self._gop) > self._gop_cap:
+                # Ключевого кадра давно нет (некоторые вещатели отдают их редко).
+                # Тогда буфер теряет выравнивание: режем его и помечаем, чтобы НЕ
+                # отдавать затравку из середины GOP — иначе клиент получит поток
+                # без параметров кадра и «вечный логотип». Такому зрителю отдаём
+                # живой поток, а мукс ждёт следующего ключевого кадра источника.
+                drop = len(self._gop) - self._gop_cap // 2
+                del self._gop[:drop]
+                self._abs_start += drop
+                self._gop_aligned = False
+
+    def gop_seed_ready(self) -> bool:
+        """Готова ли затравка (выровнена по TS-пакету/ключевому кадру, в лимите).
+
+        Дешёвая проверка без копирования буфера: по ней роутер ждёт, прежде
+        чем отдать клиенту поток, иначе первый зритель входит в середину GOP.
+        """
+        with self._gop_lock:
+            return bool(self._gop) and self._gop_aligned and \
+                len(self._gop) <= self._seed_max
+
+    def _gop_snapshot(self) -> bytes:
+        """Затравка для нового подписчика: поток от ключевого кадра с SPS/PPS.
+
+        Отдаём только выровненную по TS-пакету затравку: иначе начало попадает
+        в середину пакета или в середину GOP, и клиент декодирует битый поток.
+        """
+        with self._gop_lock:
+            if not self._gop or not self._gop_aligned:
+                return b""
+            if len(self._gop) > self._seed_max:
+                return b""
+            return bytes(self._gop)
+
     def _read_loop(self):
         # Читаем stdout ffmpeg в отдельном потоке. Очереди подписчиков —
         # asyncio.Queue, созданы в event loop, поэтому писать в них
@@ -346,9 +515,11 @@ class MuxProcess:
                     logger.info(f"[MUX] '{self.name}': ffmpeg stdout closed (EOF)")
                     break
                 self.last_data_time = time.time()
+                # mux-gop-atomic-v1: снимок GOP и регистрация подписчика под одним замком — иначе в потоке дубли/пропуски («corrupted macroblock»).
                 with self.subscribers_lock:
+                    self._ingest_gop(chunk)
                     subs_snapshot = list(self.subscribers)
-                loop = self._loop
+                    loop = self._loop
                 for q in subs_snapshot:
                     if loop is not None and loop.is_running():
                         try:
@@ -393,8 +564,26 @@ class MuxProcess:
         except RuntimeError as _e:
             self._loop = None
             logger.warning(f"[MUX] '{self.name}': subscribe without running loop: {_e}")
+        # mux-gop-atomic-v1: снимок GOP и регистрация очереди — под ОДНИМ
+        # замком с читающим потоком. Тогда «затравка» гарантированно идёт
+        # перед всеми чанками, которые подписчик получит дальше: в потоке
+        # не появляется ни пропусков, ни дублей (иначе плеер декодирует
+        # битый поток — «corrupted macroblock»).
         with self.subscribers_lock:
+            seed = self._gop_snapshot() if _GOP_SEED_ENABLED else b""
+            sent = 0
+            if seed:
+                for i in range(0, len(seed), 65536):
+                    try:
+                        q.put_nowait(seed[i:i + 65536])
+                        sent += 1
+                    except asyncio.QueueFull:
+                        break
             self.subscribers.append(q)
+        if sent:
+            self._gop_served += 1
+            logger.info(f"[MUX] '{self.name}': новому зрителю отдан GOP "
+                        f"{len(seed) // 1024} КиБ ({sent} чанков)")
         self.last_activity = time.time()
         return q
 

@@ -20,6 +20,7 @@ from services.resolver import parse_url_headers
 from services.proxy_service import (
     _proxy_googlevideo_manifest, _build_redirect_response,
     needs_mux, BLACK_MANIFEST, stale_gate_remaining,
+    ensure_jellyfin_container,
 )
 from services.fallback import try_switch_to_healthy_stream
 from services.healthcheck import revalidate_channel_in_background
@@ -84,7 +85,35 @@ def _get_or_compute_needs_mux(name: str, payload: str, active_idx: int) -> bool:
     return flag
 
 
-def _build_stream_response(name: str, request: Request, is_direct: bool, payload: str, expire_time: float, method: str, active_idx: int = None):
+def _mux_playlist(base_url: str, name: str) -> Response:
+    """Плейлист-обёртка вокруг потока мукса.
+
+    Клиент, пришедший по .m3u8-адресу, ждёт плейлист: Jellyfin открывает такой
+    вход с `-f hls`, и TS-тело он не принимает («Invalid data found when
+    processing input»). Отдаём плейлист с одним «живым» (бесконечным) сегментом
+    = поток мукса. Проверено замером: играется и с `-f hls`, и без него; видео
+    и звук на месте. Смысл: и .m3u8-, и .ts-адрес канала работают одинаково,
+    поэтому смена режима в Jellyfin больше НЕ требует чистки её кэша — а именно
+    на этом мы и спотыкались.
+    """
+    body = (
+        "#EXTM3U\n"
+        "#EXT-X-VERSION:3\n"
+        "#EXT-X-TARGETDURATION:10\n"
+        "#EXT-X-MEDIA-SEQUENCE:0\n"
+        "#EXT-X-PLAYLIST-TYPE:EVENT\n"
+        "#EXTINF:10.0,\n"
+        f"{base_url.rstrip('/')}/mux/{quote(name)}.ts\n"
+    )
+    return Response(
+        content=body,
+        media_type="application/vnd.apple.mpegurl",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate",
+                 "Pragma": "no-cache", "Expires": "0"},
+    )
+
+
+def _build_stream_response(name: str, request: Request, is_direct: bool, payload: str, expire_time: float, method: str, active_idx: int = None, want_ts: bool = False):
     """Формирует ответ для уже полученного потока.
 
     active_idx — если известен из peek/resolve, передаём явно, чтобы
@@ -93,6 +122,12 @@ def _build_stream_response(name: str, request: Request, is_direct: bool, payload
     """
     if active_idx is None:
         active_idx = _get_active_index(name)
+
+    # mediainfo-guard-v1: сверка закэшированного Jellyfin типа канала с тем, что отдаём (см. ensure_jellyfin_container).
+    try:
+        ensure_jellyfin_container(name, "ts" if want_ts else "hls")
+    except Exception as _e:
+        logger.warning(f"[MEDIAINFO] '{name}': сверка кэша не удалась: {_e}")
 
     if is_direct:
         clean_url, _ = parse_url_headers(payload)
@@ -107,9 +142,12 @@ def _build_stream_response(name: str, request: Request, is_direct: bool, payload
                 if _mux_state not in ("auto", "on", "off"):
                     _mux_state = "auto"
             if _mux_state == "on":
-                logger.info(f"[STREAM] '{name}': mux_state=on, mux forced")
-                return RedirectResponse(f"/mux/{quote(name)}.ts", status_code=302)
-            if _mux_state == "off":
+                if want_ts:
+                    logger.info(f"[STREAM] '{name}': mux_state=on, клиент на .ts → /mux")
+                    return RedirectResponse(f"{str(request.base_url).rstrip('/')}/mux/{quote(name)}.ts", status_code=302)
+                logger.info(f"[STREAM] '{name}': mux_state=on, клиент на .m3u8 → плейлист-обёртка вокруг мукса")
+                return _mux_playlist(str(request.base_url), name)
+            elif _mux_state == "off":
                 logger.info(f"[STREAM] '{name}': mux_state=off, skipping mux")
                 # mux-off-kills-v1: убить существующий мукс-процесс,
                 # иначе UI показывает MUX и healthcheck думает, что
@@ -121,36 +159,65 @@ def _build_stream_response(name: str, request: Request, is_direct: bool, payload
                     logger.warning(f"[MUX] '{name}': invalidate on off failed: {_e}")
                 # падаем вниз, отдадим через _build_redirect_response
             else:
-                # auto — текущее поведение
+                # headers-mux-restore-v1: в auto канал попадает на мукс по своему payload; Referer/Cookie этому не мешают.
                 needs_mux_flag = _get_or_compute_needs_mux(name, payload, active_idx)
                 if needs_mux_flag:
-                    logger.info(f"[STREAM] '{name}': mux selected (auto/needs_mux), redirecting to /mux/{quote(name)}.ts")
-                    return RedirectResponse(f"/mux/{quote(name)}.ts", status_code=302)
+                    if want_ts:
+                        logger.info(f"[STREAM] '{name}': mux selected (auto/needs_mux), клиент на .ts → /mux")
+                        return RedirectResponse(f"{str(request.base_url).rstrip('/')}/mux/{quote(name)}.ts", status_code=302)
+                    logger.info(f"[STREAM] '{name}': mux selected (auto/needs_mux), клиент на .m3u8 → плейлист-обёртка")
+                    return _mux_playlist(str(request.base_url), name)
         if "googlevideo.com" in payload:
             client_ua = request.headers.get("user-agent")
             proxy_response = _proxy_googlevideo_manifest(payload, client_ua)
             if proxy_response:
                 return proxy_response
-            return _build_redirect_response(payload, channel=name)
+            return _build_redirect_response(payload, channel=name, base_url=str(request.base_url).rstrip('/'))
 
-        return _build_redirect_response(payload, channel=name)
+        return _build_redirect_response(payload, channel=name, base_url=str(request.base_url).rstrip('/'))
 
     else:
         logger.info(f"[STREAM] '{name}': synthetic manifest, checking mux...")
-        if needs_mux(payload, channel_name=name):
+        # mux-state-synthetic-v1: синтетическая ветка обязана слушать mux_state так
+        # же, как ветка direct. Раньше она смотрела только на needs_mux, поэтому
+        # переключатель off не действовал: канал всё равно поднимал мукс (видно в
+        # логе на живом канале, который в мукс физически не может идти).
+        _syn_state = "auto"
+        _syn_ch = state.get_channel(name)
+        if _syn_ch:
+            _syn_state = _syn_ch.get("mux_state", "auto")
+            if _syn_state not in ("auto", "on", "off"):
+                _syn_state = "auto"
+        _syn_need = _syn_state == "on" or (
+            _syn_state == "auto" and needs_mux(payload, channel_name=name)
+        )
+        if _syn_need:
             _write_slot_key(name, active_idx, "needs_mux", True)
             state.save_cache()
-            return RedirectResponse(f"/mux/{quote(name)}.ts", status_code=302)
+            if want_ts:
+                return RedirectResponse(f"{str(request.base_url).rstrip('/')}/mux/{quote(name)}.ts", status_code=302)
+            logger.info(f"[STREAM] '{name}': synthetic + нужен мукс, клиент на .m3u8 → плейлист-обёртка")
+            return _mux_playlist(str(request.base_url), name)
+        if _syn_state == "off":
+            logger.info(f"[STREAM] '{name}': mux_state=off — синтетика отдаётся без мукса")
         # payload уже лежит в streams_cache[active_idx] (записан set_stream_cache
         # в get_channel_stream). Отдельного _synthetic_manifests больше нет.
-        return RedirectResponse(f"/synthetic/{quote(name)}.m3u8")
+        return RedirectResponse(f"{str(request.base_url).rstrip('/')}/synthetic/{quote(name)}.m3u8")
 
 
 @router.get("/redirect/{name}.m3u8")
 
 @router.get("/redirect/{name}.ts")
 async def redirect_channel_with_ext(name: str, request: Request):
-    return await redirect_channel(name, request)
+    # client-ext-v1: расширение адреса, по которому пришёл клиент, решает, что
+    # ему можно отдавать. Jellyfin классифицирует канал по расширению: для
+    # `.m3u8` он открывает вход с принудительным `-f hls`, и TS-тело (мукс)
+    # для него — `Invalid data found when processing input` (проверено
+    # замером: `ffmpeg -f hls -i /redirect/<ch>.m3u8` падает, без `-f hls` —
+    # чисто). Поэтому поток мукса отдаём только по `.ts`-адресу, а по
+    # `.m3u8` — всегда плейлист (direct/прокси).
+    want_ts = request.url.path.lower().endswith(".ts")
+    return await redirect_channel(name, request, want_ts=want_ts)
 
 
 def _handle_stream_failure(name: str, active_idx: int, error: str, now: float):
@@ -180,7 +247,7 @@ def _handle_stream_failure(name: str, active_idx: int, error: str, now: float):
     return Response(content=BLACK_MANIFEST, media_type="application/vnd.apple.mpegurl")
 
 @router.get("/redirect/{name}")
-async def redirect_channel(name: str, request: Request):
+async def redirect_channel(name: str, request: Request, want_ts: bool = False):
     state.cleanup_expired_caches()
     state.mark_channel_active(name)
 
@@ -189,9 +256,13 @@ async def redirect_channel(name: str, request: Request):
     # блокирующий резолв на 30 с.
     gate = stale_gate_remaining(name)
     if gate > 0:
-        logger.info(f"[STREAM] '{name}': stale gate active ({gate:.1f}s), answering 503")
-        return Response("Re-resolving stream", status_code=503,
-                        headers={"Retry-After": "3"})
+        # stale-gate-v1 + black-fallback: раньше здесь был 503, и Jellyfin
+        # показывал «ошибку воспроизведения» вместо канала. Теперь отдаём
+        # валидный чёрный плейлист (5 с): клиент играет чёрное и сам
+        # перезапрашивает канал, подхватывая поток после перерезолва.
+        # Гейт при этом продолжает глушить шторм резолвов.
+        logger.info(f"[STREAM] '{name}': stale gate active ({gate:.1f}s) — отдаю black manifest")
+        return Response(content=BLACK_MANIFEST, media_type="application/vnd.apple.mpegurl")
 
     active_idx = state.get_active_index(name)
     with state.cache_lock:
@@ -226,7 +297,7 @@ async def redirect_channel(name: str, request: Request):
         # active_idx берём на момент peek — тот же, что вернул payload.
         # Если healthcheck переключит активный в фоне, /redirect всё равно
         # уже отдаёт payload по старому индексу.
-        return _build_stream_response(name, request, is_direct, payload, expire_time, "stale", active_idx=active_idx)
+        return _build_stream_response(name, request, is_direct, payload, expire_time, "stale", active_idx=active_idx, want_ts=want_ts)
 
     now = time.time()
     try:
@@ -255,13 +326,13 @@ async def redirect_channel(name: str, request: Request):
                         asyncio.to_thread(state.get_channel_stream, name),
                         timeout=float(IPTV_RESOLVE_TIMEOUT),
                     )
-                    return _build_stream_response(name, request, is_direct, payload, expire_time, method, active_idx=active_idx)
+                    return _build_stream_response(name, request, is_direct, payload, expire_time, method, active_idx=active_idx, want_ts=want_ts)
                 except Exception as e2:
                     logger.error(f"[STREAM] '{name}': re-resolve after fallback failed: {e2}")
 
         return _handle_stream_failure(name, active_idx, e, now)
 
-    return _build_stream_response(name, request, is_direct, payload, expire_time, method, active_idx=active_idx)
+    return _build_stream_response(name, request, is_direct, payload, expire_time, method, active_idx=active_idx, want_ts=want_ts)
 
 @router.get("/m3u")
 def get_m3u(request: Request):
@@ -289,6 +360,7 @@ def get_m3u(request: Request):
         extinf = f'#EXTINF:-1 {" ".join(attrs)},{display_name}'
         lines.append(extinf)
 
+        # all-m3u8-v2: адрес канала в /m3u всегда .m3u8, тело всегда плейлист (свой прокси-плейлист или обёртка вокруг мукса). Jellyfin подставляет -f по закэшированному типу канала, поэтому расширение и тело обязаны совпадать при любом режиме.
         url_line = f'{base_url}/redirect/{quote(name)}.m3u8'
         logger.debug(f"[M3U] '{name}' -> {url_line}")
         lines.append(url_line)

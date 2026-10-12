@@ -52,19 +52,36 @@ def _ensure_black_ts():
         logger.info(f"[BLACK] {path} already exists, skipping generation")
         return
     try:
-        result = subprocess.run([
-            "ffmpeg", "-y",
-            "-f", "lavfi", "-i", "color=c=black:s=320x240:d=5:r=25",
-            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
-            "-t", "5",
-            "-c:v", "mpeg2video", "-b:v", "200k",
-            "-c:a", "mp2", "-b:a", "64k",
-            "-f", "mpegts", path,
-        ], capture_output=True, timeout=30)
-        if result.returncode != 0:
-            logger.error(f"[BLACK] ffmpeg exited with code {result.returncode}: {result.stderr.decode('utf-8', errors='ignore')[:300]}")
-        else:
-            logger.info(f"[BLACK] generated {path} ({os.path.getsize(path)} bytes)")
+        # black-params-v1: чёрный поток держим в тех же кодеках, что у каналов
+        # (H.264 + AAC), и повторяем параметры кадра (SPS/PPS) перед каждым
+        # ключевым кадром. MPEG-2/MP2 формально декодируется, но заставляет
+        # клиента транскодировать, а поток без параметров кадра даёт ошибку
+        # декодирования у строгих плееров. Если libx264 недоступен —
+        # откатываемся на прежний вариант.
+        variants = [
+            ["-c:v", "libx264", "-preset", "veryfast", "-profile:v", "main",
+             "-g", "25", "-keyint_min", "25", "-sc_threshold", "0",
+             "-pix_fmt", "yuv420p", "-bsf:v", "dump_extra=freq=keyframe",
+             "-c:a", "aac", "-b:a", "96k"],
+            ["-c:v", "mpeg2video", "-b:v", "200k", "-c:a", "mp2", "-b:a", "64k"],
+        ]
+        for extra in variants:
+            result = subprocess.run([
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", "color=c=black:s=1280x720:d=5:r=25",
+                "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+                "-t", "5",
+                *extra,
+                "-f", "mpegts", path,
+            ], capture_output=True, timeout=60)
+            if result.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 1000:
+                logger.info(f"[BLACK] generated {path} ({os.path.getsize(path)} bytes)")
+                return
+            logger.warning(
+                f"[BLACK] вариант не удался (code {result.returncode}): "
+                f"{result.stderr.decode('utf-8', errors='ignore')[:200]}"
+            )
+        logger.error(f"[BLACK] ни один вариант не дал файл: {path}")
     except Exception as e:
         logger.error(f"[BLACK] generation failed: {e}")
 

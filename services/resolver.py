@@ -50,6 +50,8 @@ from services.hls_utils import (        # noqa: F401
     probe_stream_types,
     fetch_manifest_text,
     tcp_reachable,
+    first_segment_ok,
+    manifest_is_drm,
 )
 from services.ad_detect import _is_ad_manifest              # noqa: F401
 from services.chromium import (         # noqa: F401
@@ -489,6 +491,16 @@ def probe_stream(payload: str, timeout: int = 10, channel: str = None) -> dict:
                 logger.warning(f"[PROBE] {ch_pfx}аудио-лист не отдаётся: {_pick['audio'][:100]}")
                 return {"ok": False, "detail": "audio group playlist not playable"}
             video_url = _pick.get("video") or video_url
+        # probe-segment-v1: проверяем реальный сегмент листа, а не только сам лист
+        _leaf_text = fetch_manifest_text(video_url, timeout=3)
+        if _leaf_text and manifest_is_drm(_leaf_text):
+            logger.warning(f"[PROBE] {ch_pfx}лист защищён DRM (SAMPLE-AES/неслужебный ключ) → отбраковка")
+            return {"ok": False, "detail": "drm-protected manifest"}
+        if _leaf_text and "#EXTINF" in _leaf_text:
+            _ok_seg, _why_seg = first_segment_ok(_leaf_text, video_url)
+            if not _ok_seg:
+                logger.warning(f"[PROBE] {ch_pfx}сегмент не играется: {_why_seg}")
+                return {"ok": False, "detail": f"segment not playable ({_why_seg})"}
         clean_url, _ = parse_url_headers(video_url)
     start_time = time.time()
     # probe-fast-fail-v1: мёртвый хост отсекаем TCP-коннектом (3 с) вместо
@@ -562,6 +574,22 @@ def probe_stream(payload: str, timeout: int = 10, channel: str = None) -> dict:
                         return {"ok": False, "detail": "audio group playlist not playable"}
                 if _pick.get("video"):
                     clean_url = _pick["video"]
+        # probe-segment-v1: master и его дочерние листы могут отдаваться 200, а
+        # сегменты — 403 (сессионные SSAI-источники, SkyCDP/MediaTailor). Такую
+        # ссылку нельзя сохранять: мукс получит 403 на сегментах, а канал уйдёт
+        # в чёрный экран/ошибку уже после старта. Поэтому дёргаем реальный сегмент.
+        if not url_path_lower.endswith((".ts", ".mp4", ".mpd")):
+            _pl_text = fetch_manifest_text(clean_url, ua=_hdrs_ua, referer=_hdrs_ref,
+                                           cookie=_hdrs_ck, timeout=3)
+            if _pl_text and manifest_is_drm(_pl_text):
+                logger.warning(f"[PROBE] {ch_pfx}поток защищён DRM (SAMPLE-AES/неслужебный ключ) → отбраковка")
+                return {"ok": False, "detail": "drm-protected manifest"}
+            if _pl_text and "#EXTINF" in _pl_text:
+                _ok_seg, _why_seg = first_segment_ok(_pl_text, clean_url, ua=_hdrs_ua,
+                                                     referer=_hdrs_ref, cookie=_hdrs_ck)
+                if not _ok_seg:
+                    logger.warning(f"[PROBE] {ch_pfx}сегмент не играется: {_why_seg}")
+                    return {"ok": False, "detail": f"segment not playable ({_why_seg})"}
         cmd = ["ffprobe", "-v", "error",
                "-show_entries", "stream=codec_type,codec_name", "-of", "json",
                # probe-bounded-analysis-v1: ограничиваем разбор 3 с/1.5 МБ, как это

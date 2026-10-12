@@ -281,3 +281,72 @@ def tcp_reachable(url: str, timeout: float = 3.0) -> bool:
             return True
     except Exception:
         return False
+
+
+# ---------- Проверка, что отдаётся реальный СЕГМЕНТ, а не только плейлист ----------
+def manifest_is_drm(playlist_text: str) -> bool:
+    """Манифест защищён DRM-схемой, которую отдать клиенту нельзя.
+
+    Признаки (свойства, не имена хостов):
+      * `#EXT-X-KEY:METHOD=SAMPLE-AES` — пофреймовое шифрование FairPlay/Widevine;
+      * URI ключа неслужебной схемы (`skd://`, `data:` и т.п.) — наш прокси такой
+        ключ отдать не может, и клиент падает на «Unable to open key file», а
+        прокси сыпет 502 на каждый сегмент (замер: 3167 ошибок у клиента).
+    Такой поток обязан отбраковываться в пробе: иначе он становится активным
+    и канал «падает по ошибке воспроизведения», хотя рядом лежит живой поток.
+    """
+    for line in (playlist_text or "").splitlines():
+        if not line.startswith(("#EXT-X-KEY:", "#EXT-X-SESSION-KEY:")):
+            continue
+        if "METHOD=SAMPLE-AES" in line.replace(" ", ""):
+            return True
+        m = re.search(r'URI="([^"]+)"', line)
+        if m and not m.group(1).lower().startswith(("http://", "https://", "data:")):
+            return True
+    return False
+
+
+def first_segment_ok(playlist_text: str, base_url: str, ua: str = None,
+                     referer: str = None, cookie: str = None,
+                     timeout: int = 4, min_bytes: int = 4000) -> tuple:
+    """Отдаётся ли первый сегмент из плейлиста.
+
+    Зачем: часть CDN (SSAI-склейки, подписанные сессионные потоки) отдаёт
+    master и дочерние плейлисты с кодом 200, а сами сегменты — 403 без
+    сессионной cookie. Такая ссылка не играется ни плеером, ни муксом, но
+    проверка «плейлист отдаётся» считала её живой: ссылка сохранялась, мукс
+    получал 403 на сегментах и канал уходил в чёрный экран/ошибку уже после
+    старта. Здесь мы дёргаем ровно то, что пойдёт в плеер.
+
+    Возвращает (ok: bool, причина: str).
+    """
+    seg = None
+    for line in (playlist_text or "").splitlines():
+        s = line.strip()
+        if s and not s.startswith("#"):
+            seg = urllib.parse.urljoin(base_url, s)
+            break
+    if not seg:
+        return False, "в плейлисте нет сегментов"
+    clean, _ = parse_url_headers(seg)
+    if not clean.startswith("http"):
+        return False, "сегмент не абсолютный URL"
+    headers = {"User-Agent": ua or IPTV_DEFAULT_UA, "Range": f"bytes=0-{min_bytes}"}
+    if referer:
+        headers["Referer"] = referer
+    if cookie:
+        headers["Cookie"] = cookie
+    try:
+        req = urllib.request.Request(clean, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", 200)
+            if status not in (200, 206):
+                return False, f"сегмент HTTP {status}"
+            data = resp.read(min_bytes)
+    except urllib.error.HTTPError as e:
+        return False, f"сегмент HTTP {e.code}"
+    except Exception as e:
+        return False, f"сегмент недоступен ({type(e).__name__})"
+    if len(data) < 1000:
+        return False, f"сегмент слишком короткий ({len(data)} Б)"
+    return True, f"сегмент ок ({len(data)} Б)"

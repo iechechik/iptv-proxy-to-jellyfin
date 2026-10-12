@@ -1,0 +1,9 @@
+[Unit]
+Description=Flaresolverr restart
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+Unit=flaresolverr_iptv.service
+
+[Install]
+WantedBy=timers.target

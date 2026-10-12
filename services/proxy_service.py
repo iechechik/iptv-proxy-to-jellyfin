@@ -1,3 +1,6 @@
+import os
+import glob
+import json
 import re
 import threading
 import time
@@ -8,9 +11,41 @@ from fastapi import Response
 from fastapi.responses import RedirectResponse
 import gzip
 
-from core.config import logger, IPTV_MANAGE_URL, IPTV_DEFAULT_UA, IPTV_FETCH_TIMEOUT, IPTV_FLARESOLVERR_URL
+from core.config import (logger, IPTV_MANAGE_URL, IPTV_DEFAULT_UA, IPTV_FETCH_TIMEOUT,
+                         IPTV_FLARESOLVERR_URL, IPTV_JELLYFIN_MEDIAINFO_DIR)
 import core.state as state
 from services.resolver import parse_url_headers
+
+# mediainfo-guard-v1: сверка закэшированного Jellyfin типа канала с тем, что отдаём (см. ensure_jellyfin_container).
+def ensure_jellyfin_container(name: str, expect: str) -> int:
+    """Сверить тип канала в кэше Jellyfin с ожидаемым. Возвращает число удалённых записей."""
+    folder = IPTV_JELLYFIN_MEDIAINFO_DIR
+    if not name or not folder or not os.path.isdir(folder):
+        return 0
+    prefix = f"{IPTV_MANAGE_URL}/redirect/{name}"
+    removed = 0
+    for path in glob.glob(os.path.join(folder, "*.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        p = data.get("Path") or ""
+        if not isinstance(p, str) or not p.startswith(prefix):
+            continue
+        actual = str(data.get("Container") or "").strip().lower()
+        if actual == "mpegts":
+            actual = "ts"
+        if actual and actual != expect:
+            try:
+                os.remove(path)
+                removed += 1
+                logger.warning(
+                    f"[MEDIAINFO] '{name}': в кэше '{actual}', отдаём '{expect}' → сброшена запись {os.path.basename(path)}"
+                )
+            except Exception as e:
+                logger.warning(f"[MEDIAINFO] '{name}': не удалил {os.path.basename(path)}: {e}")
+    return removed
 
 # ---------------------------------------------------------------------------
 # stale-gate-v1: реакция на «CDN отверг подписанную ссылку»
@@ -110,6 +145,8 @@ def needs_mux(payload: str, channel_name: str = None) -> bool:
         logger.info(f"[MUX] '{tag}': not .m3u8, result=False")
         return _remember(False, _NEEDS_MUX_TTL)
 
+    # headers-mux-restore-v1: в auto канал попадает на мукс по своему payload; Referer/Cookie этому не мешают.
+
     try:
         headers = {"User-Agent": headers_dict.get("User-Agent", IPTV_DEFAULT_UA)}
         if "Referer" in headers_dict:
@@ -125,6 +162,9 @@ def needs_mux(payload: str, channel_name: str = None) -> bool:
         with urllib.request.urlopen(req, timeout=IPTV_FETCH_TIMEOUT) as resp:
             content = read_response_text(resp)
         has_audio = "#EXT-X-MEDIA:TYPE=AUDIO" in content
+        # (DRM-поток здесь НЕ форсируем: SAMPLE-AES с неслужебным ключом не
+        # отдаст ни прокси, ни мукс — такой поток должен отбраковываться в
+        # пробе, а не уезжать клиенту через мукс. См. resolver.probe_stream.)
         head = content[:80].replace("\n", " ").replace("\r", " ")
         logger.info(
             f"[MUX] '{tag}': http_ok, len={len(content)}, "
@@ -164,7 +204,7 @@ def _proxy_googlevideo_manifest(payload: str, client_ua: str) -> Optional[Respon
         logger.error(f"[PROXY-GOOGLE] manifest proxy error: {e}")
         return None
 
-def _build_redirect_response(payload: str, channel: str = None):
+def _build_redirect_response(payload: str, channel: str = None, base_url: str = None):
     clean_url, headers_dict = parse_url_headers(payload)
 
     referer = headers_dict.get("Referer", "") if isinstance(headers_dict, dict) else ""
@@ -195,7 +235,12 @@ def _build_redirect_response(payload: str, channel: str = None):
     # proxy-urls-v2: /hls/{channel}.m3u8?url=... — расширение в конце URL,
     # иначе Jellyfin-ffmpeg 8.1 ругается "mismatches allowed extensions".
     _ch_for_url = quote(channel or "stream", safe='')
-    proxy_url = f"/hls/{_ch_for_url}.m3u8?url={quote(clean_url, safe='')}"
+    # redirect-absolute-location-v1: Location обязан быть абсолютным.
+    # Относительный "/hls/..." браузер разворачивает, а ffmpeg/Jellyfin — нет:
+    # он падает на открытии входа с "Invalid argument" и показывает «ошибку
+    # воспроизведения». База — адрес, по которому клиент пришёл на /redirect.
+    _base = (base_url or "").rstrip('/')
+    proxy_url = f"{_base}/hls/{_ch_for_url}.m3u8?url={quote(clean_url, safe='')}"
     if referer:
         proxy_url += f"&referer={quote(referer, safe='')}"
     if cookie:
@@ -239,6 +284,12 @@ def fix_hls_manifest(manifest_text: str, base_url: str, referer: str = None, coo
         # kind=segment раньше всегда давал .ts, но сегмент subtitle-манифеста
         # может быть .vtt → .vtt в конце URL обязателен для ffmpeg 8.1.
         abs_uri = urljoin(base_url, uri)
+        # non-http-uri-v1: URI нестандартной схемы (skd:// у FairPlay, data:)
+        # проксировать нельзя. Раньше из него собирался наш /hls/…key?url=skd://…
+        # и клиент падал на «Unable to open key file», а прокси сыпал 502 на
+        # каждый сегмент (замер: 3167 ошибок у клиента). Оставляем как есть.
+        if not abs_uri.lower().startswith(("http://", "https://")):
+            return uri
         if "googlevideo.com" in abs_uri:
             return abs_uri
         _ch = quote(channel or "stream", safe='')

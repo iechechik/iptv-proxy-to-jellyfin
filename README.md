@@ -66,6 +66,33 @@ Jellyfin ──/m3u──▶ канал ──/redirect/{name}.m3u8──▶ р�
 - Jellyfin (или совместимый клиент с M3U + XMLTV)
 - FlareSolverr — только если используете резолверы через него
 
+## Связка с Jellyfin: что обязательно
+
+Сервис рассчитан на то, что Jellyfin стоит **на той же машине**. Это не идеология,
+а следствие механики: чтобы канал не «залипал» после смены режима доставки, сервис
+сам удаляет запись канала в mediainfo-кэше Jellyfin (см. раздел ниже). Значит ему
+нужен доступ к тому же каталогу, и отсюда три жёстких требования:
+
+- **Jellyfin не может жить на другом физическом сервере.** Каталог кэша Jellyfin
+  монтируется в контейнер сервиса (`<jellyfin>/cache/mediainfo:/jellyfin-mediainfo-cache`),
+  по сети без отдельной обвязки (сетевые файловые системы, права, синхронизация)
+  этот механизм не работает.
+- **Сервису нужны права удалять эти файлы.** В примере compose контейнер работает
+  от `root` (UID 0) — самый простой вариант. Если root недопустим, нужен другой
+  механизм: общий UID/GID с Jellyfin и права на запись в каталог, либо собственный
+  обработчик на стороне Jellyfin (вызывается вместо удаления файлов).
+- **Плееру (тюнеру Jellyfin) нужно отключить чтение «в реальном времени».** С включённой
+  опцией Jellyfin читает живой источник ровно в 1×, его HLS всегда на самой кромке,
+  у клиента нет буфера — и канал замирает сразу после старта примерно на один сегмент,
+  а потом «сам» продолжает. В Jellyfin: тюнер M3U → снять «Read at native framerate»
+  (в `livetv.xml` — `<ReadAtNativeFramerate>false</ReadAtNativeFramerate>`).
+
+Дополнительно, уже про воспроизведение: **адрес канала в `/m3u` менять нельзя.**
+Jellyfin выводит id канала из URL, поэтому смена адреса заводит новый канал, а старый
+остаётся сиротой с ошибкой `Unable to find host to play channel` — до пересканирования
+тюнера. В этом сервисе расширение адреса зафиксировано (`.m3u8`), режим доставки влияет
+только на тело ответа.
+
 ## Быстрый старт
 
 **1. Рабочий каталог и примеры:**
@@ -195,7 +222,17 @@ payload выбрасывается каждые 30 секунд, канал ух
 | `on` | Принудительно через мукс. Нужно для источников, которые Jellyfin не читает напрямую (SSAI-склейки, AES-128 и т.п.). |
 | `off` | Принудительно без мукса. Для каналов с раздельными A/V это даст воспроизведение без звука — Jellyfin сам дорожки не миксует. |
 
+Рабочий режим — `auto`: сервис сам решает по форме потока (мастер с отдельной
+аудиогруппой → поток мукса, иначе обычный HLS-плейлист). `off` — диагностический:
+перед его проверкой нужно вручную почистить mediainfo-кэш Jellyfin (см. раздел ниже),
+иначе клиент несколько раз покажет логотип со спиннером, прежде чем заиграет.
+
 Приоритет: `mux_state` активного потока > `needs_mux` из кэша.
+
+Мукс сам определяет формат источника: если сегменты приходят в fMP4 (`.m4s`,
+`#EXT-X-MAP`), битстрим-фильтр параметров кадра не ставится — на AVCC-пакетах он
+падает и убивает сессию («Error applying bitstream filters to an output packet»),
+а параметры кадра при упаковке в MPEG-TS всё равно вставляет сам ffmpeg.
 
 Что сервис делает при старте мукса:
 
@@ -322,6 +359,21 @@ volumes:
 Путь настраивается через `IPTV_JELLYFIN_MEDIAINFO_DIR` или
 `config.json → jellyfin.mediainfo_cache_dir`.
 
+Если смену режима сделали в обход сервиса (правили конфиг руками, переключали
+каналы при выключенном сервисе), запись канала остаётся старой. Лечится разово:
+удалить в `<jellyfin>/cache/mediainfo/` записи, у которых `Path` начинается с адреса
+сервиса (`/redirect/`), — медиатеку это не затрагивает, у неё другие пути. Учтите,
+что без прав на запись в этот каталог автоматическая чистка молча не работает:
+в логе появятся `[MEDIAINFO] … folder not available` или отказ удаления.
+
+Разом вычистить записи всех каналов можно скриптом `scripts/clear_channel_mediainfo.py`
+(он удаляет только записи с нашим `Path`, медиатеку не трогает, есть `--dry-run`):
+
+```bash
+python3 scripts/clear_channel_mediainfo.py --dry-run   # посмотреть
+python3 scripts/clear_channel_mediainfo.py             # удалить
+```
+
 ## Внешние M3U-плейлисты
 
 `playlist_sources` подключает публичные M3U (GitHub, кураторские списки) как
@@ -374,6 +426,16 @@ volumes:
 
 ## Watchdog FlareSolverr
 
+Готовые systemd-юниты для этого скрипта лежат в каталоге `systemd/`
+(`flaresolverr_iptv.{service,timer}` — проверка раз в минуту по flag-файлу,
+`flaresolverr_restart.{service,timer}` — плановый рестарт контейнера). Установка:
+
+```bash
+sudo cp systemd/flaresolverr*.* /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now flaresolverr_iptv.timer flaresolverr_restart.timer
+```
+
 `restart_flaresolverr.sh` — опциональный скрипт на случай, когда FlareSolverr
 иногда зависает. Сервис при ошибке FlareSolverr кладёт flag-файл
 (`healthcheck.flaresolverr_flag_file`), скрипт по таймеру (например,
@@ -419,5 +481,21 @@ Key points worth knowing:
 - **Config:** `config.example.json` documents every supported key;
   `override.example.json` shows temporary overrides (merged on top at startup).
   The API key goes into the environment (`IPTV_JELLYFIN_API_KEY`).
+
+- **Jellyfin is a hard dependency, not just a client.** The service deletes the
+  channel's `cache/mediainfo` record (otherwise Jellyfin replays it with a stale
+  container type and the channel breaks), so Jellyfin must run on the SAME host, its
+  mediainfo directory must be mounted into this container, and the service needs
+  permission to delete those files (root in the example compose, or a shared
+  UID/GID / your own handler). Also set the M3U tuner's
+  `ReadAtNativeFramerate=false`: with `true` Jellyfin reads the live source at
+  exactly 1× and its own HLS sits on the live edge, which makes clients freeze for
+  about one segment right after start.
+- **A channel's URL in `/m3u` is a stable contract.** Jellyfin derives the channel id
+  from it, so changing the address orphans the old channel
+  (`Unable to find host to play channel`) until the tuner is re-scanned; the extension
+  stays `.m3u8` and the delivery mode changes only the response body.
+- **Delivery mode `auto` is the supported one**; `on` forces the mux, `off` disables it
+  (diagnostic only: needs a manual mediainfo clear and may play without sound).
 
 Full details are in the Russian part above — it is the authoritative version.

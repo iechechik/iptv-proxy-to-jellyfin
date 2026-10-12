@@ -25,7 +25,6 @@ COPY routers/*.py ./routers/
 COPY services/*.py ./services/
 COPY core/*.py ./core/
 COPY web ./web
-COPY restart_flaresolverr.sh .
 RUN mkdir -p /app/db /app/logs
 
 EXPOSE 8000

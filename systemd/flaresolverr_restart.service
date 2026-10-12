@@ -1,0 +1,11 @@
+[Unit]
+Description=Flaresolverr restart
+After=network.target docker.service 
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=docker restart flaresolverr
+User=root
+Group=root
+RemainAfterExit=no

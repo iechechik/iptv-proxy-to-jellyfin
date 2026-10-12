@@ -336,6 +336,7 @@ if CONFIG_DATA:
     IPTV_MUX_IDLE_TIMEOUT = get_config_value("mux", "idle_timeout", IPTV_MUX_IDLE_TIMEOUT)
     IPTV_FFMPEG_LOG_LEVEL = get_config_value("mux", "ffmpeg_log_level", IPTV_FFMPEG_LOG_LEVEL)
 
+
     IPTV_HEALTHCHECK_WORKERS = get_config_value("healthcheck", "workers", IPTV_HEALTHCHECK_WORKERS)
     IPTV_HEALTHCHECK_INTERVAL = get_config_value("healthcheck", "scheduler_interval", IPTV_HEALTHCHECK_INTERVAL)
     IPTV_HEALTHCHECK_MIN_INTERVAL = get_config_value("healthcheck", "scheduler_min_interval", IPTV_HEALTHCHECK_MIN_INTERVAL)

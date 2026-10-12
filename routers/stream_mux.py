@@ -4,9 +4,10 @@ routers/stream_mux.py — A/V-мукс.
 После stream-refactor-v1: /mux/{name}.ts.
 """
 from fastapi import APIRouter, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 import asyncio
 import re
+import time
 import urllib.error
 import urllib.request
 
@@ -26,6 +27,18 @@ _variant_av_cache = {}
 
 router = APIRouter()
 
+# mux-black-fallback-v1: сколько ждать первый байт от мукса, прежде чем
+# отдать чёрный поток. Источник по HLS отдаёт данные пачками (по границам
+# сегментов, у некоторых вещателей сегмент ~10 секунд), поэтому пауза в
+# несколько секунд — норма, а не поломка. 12 секунд покрывают холодный старт
+# ffmpeg и один сегмент живого плейлиста; чёрный остаётся крайней мерой.
+_MUX_FIRST_DATA_WAIT = 12.0
+
+# mux-seed-wait-v1: сколько ждать готовую затравку (выровненную по ключевому
+# кадру) перед началом отдачи. Пик — холодный старт ffmpeg (1-3 с), но
+# ограничиваем: лучше отдать живой поток, чем держать клиент без ответа.
+_MUX_SEED_WAIT = 10.0
+
 @router.get("/mux/{name}.ts")
 async def mux_stream(name: str, request: Request):
     logger.info(f"[MUX] '{name}': mux requested")
@@ -36,9 +49,13 @@ async def mux_stream(name: str, request: Request):
     # шторм запросов по мёртвой ссылке, а плеер висит на логотипе.
     gate = stale_gate_remaining(name)
     if gate > 0:
-        logger.info(f"[MUX] '{name}': stale gate active ({gate:.1f}s), answering 503")
-        return Response("Re-resolving stream", status_code=503,
-                        headers={"Retry-After": "5"})
+        # mux-black-fallback-v1: раньше здесь был 503 «Re-resolving stream» —
+        # Jellyfin на него отвечает мгновенной ошибкой воспроизведения, а
+        # телевизор висит на логотипе. Отдаём валидный чёрный поток: клиент
+        # играет 5 секунд чёрного и сам перезапрашивает канал, подхватывая
+        # живой поток, как только он появится.
+        logger.info(f"[MUX] '{name}': stale gate active ({gate:.1f}s) — отдаю black.ts")
+        return RedirectResponse(url=f"{str(request.base_url).rstrip('/')}/black.ts", status_code=302)
 
     mux_proc = get_live_mux(name)
     if mux_proc is not None:
@@ -176,33 +193,64 @@ async def mux_stream(name: str, request: Request):
     # q инициализируем None: если subscribe() упадёт, finally не сломается
     # на NameError, а корректно пропустит unsubscribe.
     q = None
+    # mux-seed-wait-v1: сначала дожидаемся готовой затравки (заголовок потока
+    # от последнего ключевого кадра). Без неё первый зритель входит в середину
+    # GOP: за своё прощупывание (Jellyfin ~3 с / 1.5 МБ) он не находит ни
+    # одного ключевого кадра и показывает «вечный логотип» / ошибку
+    # воспроизведения. Так же ведёт себя обычный плеер: он ждёт начало GOP.
+    try:
+        deadline = time.monotonic() + _MUX_SEED_WAIT
+        while not mux_proc.gop_seed_ready() and time.monotonic() < deadline:
+            await asyncio.sleep(0.2)
+        if not mux_proc.gop_seed_ready():
+            logger.info(f"[MUX] '{name}': затравка не готова за {_MUX_SEED_WAIT:.0f} с — отдаю живой поток")
+    except Exception as _e:
+        logger.warning(f"[MUX] '{name}': ожидание затравки сорвалось: {_e}")
+
     q = mux_proc.subscribe()
+
+    # mux-black-fallback-v1: не держим зрителя молча. Ждём первый байт до
+    # _MUX_FIRST_DATA_WAIT секунд: HLS-источник отдаёт данные пачками (по
+    # границам сегментов), поэтому «нет данных» 1-2 секунды — норма, а не
+    # поломка. Если данных нет дольше (мукс мёртв/холодный вход) — отдаём
+    # чёрный поток: Jellyfin проиграет 5 секунд чёрного и сам перезапросит
+    # канал, подхватив живой поток.
+    try:
+        first_chunk = await asyncio.wait_for(q.get(), timeout=_MUX_FIRST_DATA_WAIT)
+    except asyncio.TimeoutError:
+        if q is not None:
+            mux_proc.unsubscribe(q)
+        logger.warning(f"[MUX] '{name}': нет данных за {_MUX_FIRST_DATA_WAIT:.0f} с — отдаю black.ts")
+        return RedirectResponse(url=f"{str(request.base_url).rstrip('/')}/black.ts", status_code=302)
 
     async def stream_generator():
         # MUX-BATCH-READ: q — asyncio.Queue, читаем напрямую через await q.get(),
         # без thread-hop. После первого чанка забираем всё, что уже накопилось
         # (get_nowait), чтобы уменьшить число yield-переключений event loop.
         empty_count = 0
+        pending = [first_chunk]
         try:
             while True:
-                batch = []
-                try:
-                    chunk = await asyncio.wait_for(q.get(), timeout=1.0)
-                    batch.append(chunk)
-                    # Добираем всё, что уже в очереди, без блокировки
-                    while True:
-                        try:
-                            nxt = q.get_nowait()
-                            batch.append(nxt)
-                        except asyncio.QueueEmpty:
+                batch = pending
+                pending = []
+                if not batch:
+                    try:
+                        chunk = await asyncio.wait_for(q.get(), timeout=1.0)
+                        batch.append(chunk)
+                        # Добираем всё, что уже в очереди, без блокировки
+                        while True:
+                            try:
+                                nxt = q.get_nowait()
+                                batch.append(nxt)
+                            except asyncio.QueueEmpty:
+                                break
+                        empty_count = 0
+                    except asyncio.TimeoutError:
+                        empty_count += 1
+                        if empty_count >= 30:
+                            logger.warning(f"[MUX] '{name}': no data for 30s, closing stream")
                             break
-                    empty_count = 0
-                except asyncio.TimeoutError:
-                    empty_count += 1
-                    if empty_count >= 30:
-                        logger.warning(f"[MUX] '{name}': no data for 30s, closing stream")
-                        break
-                    continue
+                        continue
 
                 stop = False
                 for chunk in batch:

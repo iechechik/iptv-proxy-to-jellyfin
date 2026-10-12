@@ -1,0 +1,9 @@
+[Unit]
+Description=Flaresolverr restart
+
+[Timer]
+OnCalendar=*-*-* 06:15:00
+Unit=flaresolverr_restart.service
+
+[Install]
+WantedBy=timers.target
