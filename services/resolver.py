@@ -330,7 +330,8 @@ def _normalize_embed_url(url: str) -> str:
 
 def _resolve_browser_sniffer(ch):
     name = ch["name"]
-    sniff_res = resolve_via_browser_sniffer(ch["url"], ch.get("ua", IPTV_DEFAULT_UA))
+    sniff_res = resolve_via_browser_sniffer(ch["url"], ch.get("ua", IPTV_DEFAULT_UA),
+                                channel_name=name)
     if not sniff_res:
         raise RuntimeError("sniffer не нашёл m3u8/embed")
     if sniff_res["type"] == "m3u8":

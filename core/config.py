@@ -161,6 +161,8 @@ IPTV_FALLBACK_SWITCH_MIN_SEC_ACTIVE = float(os.getenv("IPTV_FALLBACK_SWITCH_MIN_
 IPTV_FALLBACK_SWITCH_SPEEDUP_SEC = float(os.getenv("IPTV_FALLBACK_SWITCH_SPEEDUP_SEC", "1.0"))
 
 IPTV_SNIFFER_LIMIT = int(os.getenv("IPTV_SNIFFER_LIMIT", "5"))
+# embed-grace-v1: сколько ждать свой манифест, если страница уже отдала встройку.
+IPTV_SNIFFER_EMBED_GRACE = int(os.getenv("IPTV_SNIFFER_EMBED_GRACE", "9"))
 IPTV_FLARESOLVERR_LIMIT = int(os.getenv("IPTV_FLARESOLVERR_LIMIT", "5"))
 IPTV_PROBE_LIMIT = int(os.getenv("IPTV_PROBE_LIMIT", "2"))
 IPTV_RESOLVER_LIMIT = int(os.getenv("IPTV_RESOLVER_LIMIT", "5"))
@@ -351,6 +353,9 @@ if CONFIG_DATA:
     IPTV_FALLBACK_SWITCH_SPEEDUP_SEC = get_config_value("fallback", "switch_speedup_sec", IPTV_FALLBACK_SWITCH_SPEEDUP_SEC)
 
     IPTV_SNIFFER_LIMIT = get_config_value("limits", "sniffer", IPTV_SNIFFER_LIMIT)
+    IPTV_SNIFFER_EMBED_GRACE = get_config_value(
+        "resolver", "sniffer_embed_grace", IPTV_SNIFFER_EMBED_GRACE
+    )
     IPTV_FLARESOLVERR_LIMIT = get_config_value("limits", "flaresolverr", IPTV_FLARESOLVERR_LIMIT)
     IPTV_PROBE_LIMIT = get_config_value("limits", "probe", IPTV_PROBE_LIMIT)
     IPTV_RESOLVER_LIMIT = get_config_value("limits", "resolver", IPTV_RESOLVER_LIMIT)
@@ -643,6 +648,7 @@ def save_full_config(channels: list = None) -> bool:
     CONFIG_DATA["resolver"] = {
         "default_ua": IPTV_DEFAULT_UA,
         "playwright_chromium": IPTV_PLAYWRIGHT_CHROMIUM,
+        "sniffer_embed_grace": IPTV_SNIFFER_EMBED_GRACE,
         "flaresolverr_url": IPTV_FLARESOLVERR_URL,
         "order": IPTV_RESOLVER_ORDER,
         "streamlink_timeout": IPTV_STREAMLINK_TIMEOUT,

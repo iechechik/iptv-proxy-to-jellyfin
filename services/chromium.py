@@ -18,6 +18,7 @@ from core.config import (
     IPTV_DEFAULT_UA,
     IPTV_PLAYWRIGHT_CHROMIUM,
     IPTV_PLAYWRIGHT_NAVIGATION_TIMEOUT,
+    IPTV_SNIFFER_EMBED_GRACE,
     logger,
 )
 from services.hls_utils import (
@@ -27,11 +28,24 @@ from services.hls_utils import (
 from services.ad_detect import _is_ad_manifest
 
 
-COOKIE_PATTERNS = [
-    "Accept", "Accept all", "Agree", "Allow all",
-    "Tout accepter", "Accepter",
-    "Continue without accepting", "Continuer sans accepter",
-]
+# cookie-wall-v2: стена согласия не пускает плеер дальше, и мы не видим манифест.
+# Сначала ищем кнопку «принять всё» — её формулировка на сайтах стабильна, а
+# «только необходимые» каждый пишет по-своему. Отвергающие и настроечные подписи
+# пропускаем, чтобы случайно не нажать «Reject all» или «Настроить».
+_COOKIE_ACCEPT_ALL = (
+    "accept all", "allow all", "agree all", "alles accepteren",
+    "alle akzeptieren", "tout accepter", "todos aceptar", "aceptar todo",
+    "accetta tutto", "aceitar tudo", "принять все", "принять всё", "прийняти всі",
+)
+_COOKIE_ACCEPT_ANY = (
+    "accept", "allow", "agree", "consent", "got it", "akzeptieren", "accepter",
+    "accetta", "aceptar", "aceitar", "akkoord", "допустим", "принять", "согласен", "прийняти",
+)
+_COOKIE_REJECT_WORDS = (
+    "reject", "decline", "necessary", "essential", "required", "only",
+    "manage", "settings", "options", "preferences", "personalise", "customi",
+    "отклонить", "только", "необходим", "обязательн", "настроить", "выбрать",
+)
 
 
 _HLS_MASTER_NAMES = ("master.m3u8",)
@@ -274,11 +288,28 @@ def _candidate_usable(c: dict) -> bool:
     return not _candidate_expired(c.get("url", ""))
 
 
+# sniffer-caption-skip-v1: плейлист субтитров — не поток. В нём вместо видео
+# дорожки .vtt, и проба справедливо его отбраковывает («сегмент слишком короткий»),
+# а канал при этом выглядит как «резолвится, но не играет».
+_SUBTITLE_MARKERS = (".vtt", ".webvtt", ".ttml", ".srt", "caption", "subtitle")
+
+
+def _is_subtitle_playlist(url: str) -> bool:
+    """Похож ли адрес плейлиста на дорожку субтитров.
+
+    Только строковые операции: в этом модуле нет urllib.parse, и обращение к нему
+    молча возвращало False (исключение глушилось) — фильтр не работал вообще.
+    Имя файла проверяем отдельно от каталога, query при этом не учитываем.
+    """
+    text = (url or "").split("?")[0].split("#")[0].lower()
+    tail = text.rsplit("/", 1)[-1]
+    if any(m in tail for m in _SUBTITLE_MARKERS):
+        return True
+    return any(d in text for d in ("/caption", "/subtitle", "/subs/", "/subtitles/"))
+
+
 def _pick_best_candidate(candidates: list, channel_name: str = None):
-    tag = f"[{channel_name}] " if channel_name else ""
-    for c in candidates:
-        if c.get("type") == "embed":
-            return c
+    tag = f"'{channel_name}': " if channel_name else ""
     # A2: убран двойной отсев AD. Единственный критерий — флаг is_ad,
     # который проставляется в handle_request через _is_ad_url. Раньше был
     # второй фильтр по vid (сравнение ad_vids с _extract_video_id мастера),
@@ -303,6 +334,10 @@ def _pick_best_candidate(candidates: list, channel_name: str = None):
                 f"ad={bool(c.get('is_ad'))}, "
                 f"expired={_candidate_expired(c.get('url', ''))}): {c['url'][:100]}"
             )
+    for c in [x for x in usable if _is_subtitle_playlist(x.get("url", ""))]:
+        logger.info(f"[SNIFFER] {tag}candidate dropped (subtitle track): {c['url'][:120]}")
+    usable = [x for x in usable if not _is_subtitle_playlist(x.get("url", ""))]
+
     masters = [c for c in usable if c.get("is_master")]
     medias = [c for c in usable if c.get("is_media")]
     # Dailymotion-подобные плееры запрашивают дорожки отдельными плейлистами
@@ -335,17 +370,64 @@ def _pick_best_candidate(candidates: list, channel_name: str = None):
     for c in usable:
         logger.info(f"[SNIFFER] {tag}selected unclassified m3u8: {c['url'][:120]}")
         return c
+    # embed-grace-v1: встройку отдаём только резервом — если своего манифеста
+    # у страницы не оказалось вовсе.
+    for c in candidates:
+        if c.get("type") == "embed":
+            logger.info(f"[SNIFFER] {tag}selected embed (резерв): {c['url'][:120]}")
+            return c
     logger.warning(f"[SNIFFER] {tag}no usable m3u8/embed found")
     return None
 
 
-def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int, skip_urls: set = None) -> Optional[Dict[str, str]]:
+def _dismiss_cookie_wall(page, tag: str = "") -> bool:
+    """Закрыть стену согласия: без этого плеер не стартует и манифест не запрашивается.
+    Ищем сначала «принять всё», затем просто «принять». Идём по всем фреймам —
+    такие стены часто отдают в iframe. Если подходящей кнопки нет, не делаем ничего."""
+    try:
+        frames = list(page.frames)
+    except Exception:
+        return False
+    for patterns in (_COOKIE_ACCEPT_ALL, _COOKIE_ACCEPT_ANY):
+        for frame in frames:
+            for sel in ("button", "a", '[role="button"]', 'input[type="submit"]',
+                        'input[type="button"]'):
+                try:
+                    elements = frame.query_selector_all(sel)
+                except Exception:
+                    continue
+                for el in elements:
+                    try:
+                        if not el.is_visible():
+                            continue
+                        label = (el.inner_text() or el.get_attribute("value") or "").strip()
+                    except Exception:
+                        continue
+                    low = " ".join(label.lower().split())
+                    if not low or len(low) > 60:
+                        continue
+                    if any(w in low for w in _COOKIE_REJECT_WORDS):
+                        continue
+                    if any(w in low for w in patterns):
+                        try:
+                            el.click(timeout=2000)
+                        except Exception:
+                            continue
+                        logger.info(f"[SNIFFER] {tag}cookie wall dismissed ('{label[:40]}')")
+                        page.wait_for_timeout(1500)
+                        return True
+    return False
+
+
+def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int, skip_urls: set = None,
+                              channel_name: str = None) -> Optional[Dict[str, str]]:
     candidates: list = []
     found_result = None  # sniffer-unbound-fix-v1: без этого UnboundLocalError
                          # на return, если try упал до присваивания.
     found_result = None
     master_seen_ts: float = 0.0
     _skip_urls = skip_urls or set()
+    tag = f"'{channel_name}': " if channel_name else ""
     user_agent = ua or IPTV_DEFAULT_UA
     exec_path = IPTV_PLAYWRIGHT_CHROMIUM
     browser = None
@@ -374,7 +456,7 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int, skip_u
                 browser = p.chromium.launch(**launch_args)
             except Exception as _le:
                 logger.warning(
-                    f"[SNIFFER] chromium launch failed: {type(_le).__name__}: {_le} "
+                    f"[SNIFFER] {tag}chromium launch failed: {type(_le).__name__}: {_le} "
                     f"(exec_path={exec_path}, exists={os.path.exists(exec_path)})"
                 )
                 raise
@@ -389,15 +471,15 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int, skip_u
                 req_url = request.url
                 low = req_url.lower()
                 if ".mpd" in low and not any(ext in low for ext in [".ts", ".m4s", ".key", ".aac", ".mp4"]):
-                    logger.info(f"[SNIFFER] DASH ignored: {req_url[:120]}")
+                    logger.info(f"[SNIFFER] {tag}DASH ignored: {req_url[:120]}")
                     return
                 if ".m3u8" in low and not any(ext in low for ext in [".ts", ".m4s", ".key", ".aac", ".mp4", ".m4a"]):
                     if req_url in _skip_urls:
-                        logger.info(f"[SNIFFER] skip_url (previous ad): {req_url[:120]}")
+                        logger.info(f"[SNIFFER] {tag}skip_url (previous ad): {req_url[:120]}")
                         return
                     is_ad_flag = _is_ad_url(req_url)
                     if is_ad_flag:
-                        logger.info(f"[SNIFFER] ad manifest (kept for vid-compare): {req_url[:120]}")
+                        logger.info(f"[SNIFFER] {tag}ad manifest (kept for vid-compare): {req_url[:120]}")
                     m, md = _classify_hls_by_url(req_url)
                     for c in candidates:
                         if c.get("url") == req_url:
@@ -455,11 +537,11 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int, skip_u
                 if not ("mpegurl" in ct or "m3u8" in ct):
                     return
                 if url in _skip_urls:
-                    logger.info(f"[SNIFFER] skip_url (previous ad): {url[:120]}")
+                    logger.info(f"[SNIFFER] {tag}skip_url (previous ad): {url[:120]}")
                     return
                 is_ad_flag = _is_ad_url(url)
                 if is_ad_flag:
-                    logger.info(f"[SNIFFER] ad response (kept for vid-compare): {url[:120]}")
+                    logger.info(f"[SNIFFER] {tag}ad response (kept for vid-compare): {url[:120]}")
                 body_text = ""
                 try:
                     raw = response.body()
@@ -504,10 +586,10 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int, skip_u
                         pass
                     if master_seen_ts == 0.0:
                         master_seen_ts = time.time()
-                        logger.info(f"[SNIFFER] master manifest: {url[:120]}")
+                        logger.info(f"[SNIFFER] {tag}master manifest: {url[:120]}")
                 elif is_media:
                     target["is_media"] = True
-                    logger.info(f"[SNIFFER] media manifest: {url[:120]}")
+                    logger.info(f"[SNIFFER] {tag}media manifest: {url[:120]}")
                 elif not target.get("is_master") and not target.get("is_media"):
                     target["is_unclassified"] = True
 
@@ -526,25 +608,15 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int, skip_u
                 for c in candidates:
                     if c.get("url") == u:
                         c["failed"] = True
-                        logger.info(f"[SNIFFER] candidate failed ({str(request.failure)[:50]}): {u[:110]}")
+                        logger.info(f"[SNIFFER] {tag}candidate failed ({str(request.failure)[:50]}): {u[:110]}")
                         return
             page.on("requestfailed", handle_failed)
 
             try:
-                logger.info(f"[SNIFFER] loading: {target_url}")
+                logger.info(f"[SNIFFER] {tag}loading: {target_url}")
                 page.goto(target_url, wait_until="domcontentloaded", timeout=IPTV_PLAYWRIGHT_NAVIGATION_TIMEOUT)
                 page.wait_for_timeout(6000)
-                for btn_text in COOKIE_PATTERNS:
-                    if candidates:
-                        break
-                    try:
-                        button = page.get_by_role("button", name=re.compile(btn_text, re.IGNORECASE))
-                        if button.count() > 0 and button.first.is_visible():
-                            button.first.click(timeout=1500)
-                            page.wait_for_timeout(1500)
-                            break
-                    except Exception:
-                        pass
+                _dismiss_cookie_wall(page, tag)
                 if not candidates:
                     selectors = ["video", "iframe", ".vjs-big-play-button", "[class*='player']"]
                     for sel in selectors:
@@ -555,13 +627,26 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int, skip_u
                             if candidates:
                                 break
                 start_time = time.time()
+                wall_retried = False
+                embed_seen_at = 0.0
                 while True:
                     elapsed = time.time() - start_time
-                    has_embed = any(c.get("type") == "embed" for c in candidates)
-                    if has_embed:
+                    if any(c.get("type") == "m3u8" and not _is_subtitle_playlist(c.get("url", ""))
+                           for c in candidates):
                         break
+                    if any(c.get("type") == "embed" for c in candidates):
+                        # embed-grace-v1: встройка (обычно чужая платформа) всплывает
+                        # раньше плеера самой страницы. Даём своему манифесту окно —
+                        # иначе навсегда останемся на встройке.
+                        if not embed_seen_at:
+                            embed_seen_at = time.time()
+                        if time.time() - embed_seen_at >= IPTV_SNIFFER_EMBED_GRACE:
+                            break
                     if elapsed >= max_timeout:
                         break
+                    if not candidates and not wall_retried and elapsed >= 5:
+                        wall_retried = True
+                        _dismiss_cookie_wall(page, tag)
                     page.wait_for_timeout(500)
 
                 # sniffer-waitbody-v1: под нагрузкой (несколько параллельных
@@ -592,8 +677,8 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int, skip_u
                         if c.get("is_master"): flags.append("master")
                         if c.get("is_media"): flags.append("media")
                         if c.get("is_ad"): flags.append("AD")
-                        logger.info(f"[SNIFFER] candidate vid={v!r} flags={flags}: {c['url'][:120]}")
-                found_result = _pick_best_candidate(candidates, channel_name=None)
+                        logger.info(f"[SNIFFER] {tag}candidate vid={v!r} flags={flags}: {c['url'][:120]}")
+                found_result = _pick_best_candidate(candidates, channel_name=channel_name)
                 if found_result and found_result["type"] == "m3u8" and found_result.get("is_master"):
                     # sniffer-master-leaves-v1: master нужен только чтобы достать
                     # листья (video/audio), а его собственную ссылку часть CDN
@@ -625,7 +710,7 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int, skip_u
                     final_url += f"|User-Agent={user_agent}"
                     found_result["url"] = final_url
             except Exception as e:
-                logger.warning(f"[SNIFFER] parse failed: {target_url}: {e}")
+                logger.warning(f"[SNIFFER] {tag}parse failed: {target_url}: {e}")
     finally:
         try:
             if page: page.close()
@@ -648,13 +733,15 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int, skip_u
     return found_result
 
 
-def resolve_via_browser_sniffer(target_url: str, ua: str = None, max_timeout: int = 15) -> Optional[Dict[str, str]]:
+def resolve_via_browser_sniffer(target_url: str, ua: str = None, max_timeout: int = 15,
+                                channel_name: str = None) -> Optional[Dict[str, str]]:
     skip_urls = set()
     ua_final = ua or IPTV_DEFAULT_UA
     for attempt in range(2):
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(
-                _run_browser_sniffer_sync, target_url, ua_final, max_timeout, skip_urls
+                _run_browser_sniffer_sync, target_url, ua_final, max_timeout, skip_urls,
+                channel_name=channel_name,
             )
             res = future.result()
         if not res:

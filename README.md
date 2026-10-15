@@ -157,13 +157,19 @@ healthcheck'а) живут в `config.json` → полная схема со в�
 
 ## Структура config.json
 
+`config.json` — основной конфиг; при старте поверх него накладывается
+`override.json` (глубокий merge), поэтому **правки делайте только в
+`override.json`**: основной файл может быть перезаписан внешними инструментами.
+Каждый ключ читается один раз при запуске, так что после изменения нужен
+перезапуск контейнера. Полная схема с комментариями — в `config.example.json`.
+
 | Секция | Назначение |
 | --- | --- |
 | `epg` | Источники расписания: URL, интервал, фильтр, `update_time` = время VACUUM |
 | `playlist_sources` | Внешние M3U-плейлисты для поиска URL |
 | `server` | `manage_url`, имя файла override |
 | `jellyfin` | URL Jellyfin, каталог его xmltv-кэша, каталог mediainfo-кэша, таймаут API |
-| `resolver` | User-Agent по умолчанию, порядок резолверов, таймауты |
+| `resolver` | User-Agent по умолчанию, порядок резолверов, таймауты разбора |
 | `cache` | Верхние пределы TTL, пауза после неудачного резолва |
 | `mux` | Параметры ffmpeg-микшера |
 | `healthcheck` | Планировщик проактивных проверок каналов |
@@ -172,6 +178,41 @@ healthcheck'а) живут в `config.json` → полная схема со в�
 | `logging` | Уровень, буфер, ротация, путь журнала событий |
 | `analytics` | Сборщик статистики URL (по умолчанию выключен) |
 | `channels` | Список каналов |
+
+### Таймауты: что именно каждый ограничивает
+
+Все значения — в секундах. Ключ записывается в `override.json` по пути
+`секция → ключ` (например `resolver.resolve_timeout`).
+
+| Ключ | По умолчанию | Что ограничивает |
+| --- | --- | --- |
+| `resolver.resolve_timeout` | 60 | Сколько сервис ждёт разбор канала, прежде чем отдать клиенту заглушку. Это **потолок**, а не задержка: канал, разобравшийся за 0.3 с, отвечает сразу. Должен быть не меньше бюджета самого медленного метода, иначе разбор обрывается на середине |
+| `resolver.playwright_navigation_timeout` | 20 | Сколько сниффер ждёт загрузку страницы в headless-браузере, прежде чем начать искать манифест |
+| `resolver.sniffer_embed_grace` | 9 | **Окно ожидания своего манифеста.** Если на странице уже показалась встройка (обычно YouTube), сниффер ждёт ещё столько секунд собственный поток сайта и только потом берёт встройку как резерв. `0` — брать встройку сразу, как только она появилась |
+| `resolver.fetch_timeout` | 15 | Одиночный сетевой запрос: манифест, дочерний плейлист, проверка сегмента |
+| `resolver.streamlink_timeout` | 30 | Разбор через streamlink (YouTube и подобные площадки) |
+| `resolver.flaresolverr_timeout` | 70 | Разбор через FlareSolverr — самый долгий метод, отсюда и большой бюджет |
+| `healthcheck.scheduler_interval` | 30 | Как часто планировщик проверок просыпается и смотрит, каким каналам пора. Это **не** интервал проверки конкретного канала |
+| `healthcheck.scheduler_min_interval` | 300 | Минимальная пауза между проверками одного канала. Никогда не ставится больше срока жизни его ссылки — иначе payload успеет протухнуть между проверками |
+| `healthcheck.recently_active_sec` | 120 | Если к каналу обращались за это время, плановая проверка его не трогает: пробы не мешают просмотру. Смерть потока посреди просмотра ловится отдельно — по событию остановки со стороны Jellyfin |
+| `jellyfin.api_timeout` | 15 | Запросы к API Jellyfin (обновление расписания, сессии) |
+| `epg.download_timeout` | 60 | Скачивание XMLTV-источника |
+| `epg.head_timeout` | 10 | Быстрая проверка, изменился ли источник, перед скачиванием |
+| `mux.idle_timeout` | 90 | Сколько живёт процесс микширования после ухода последнего зрителя |
+
+### Ещё три ключа, которыми чаще всего крутят
+
+| Ключ | По умолчанию | Что делает |
+| --- | --- | --- |
+| `cache.cache_ttl` | 3600 | Верхний предел срока жизни ссылки, если у неё нет явного `exp` |
+| `cache.fast_cache_ttl` | 600 | То же для «быстрых» методов (yt-dlp, streamlink), где ссылки короче |
+| `cache.failed_resolve_ttl` | 60 | Сколько канал остаётся в карантине после неудачного разбора, прежде чем его попробуют снова |
+
+Связь, которую стоит помнить при настройке: `resolver.resolve_timeout` — общий
+потолок, и он должен быть не меньше суммы бюджета метода
+(`playwright_navigation_timeout` или `flaresolverr_timeout`) и последующей пробы
+манифеста. Если поставить его меньше, канал будет получать заглушку ровно тогда,
+когда ссылка вот-вот найдётся.
 
 ## Кэш и расписание проверок
 
@@ -470,6 +511,9 @@ Key points worth knowing:
   hours; TTL comes from `exp` in the URL, session markers, or the per-method cap.
 - **Checks are scheduled at 0.75 of the shortest remaining link lifetime**, never
   later than the link itself. Observed early deaths shrink the interval further.
+- **`resolver.sniffer_embed_grace`** — after a page's embed (usually YouTube)
+  appears, the sniffer still waits this many seconds for the site's OWN manifest
+  before falling back to the embed; `0` takes the embed immediately.
 - **Liveness probing verifies what actually plays** (max-bandwidth variant plus the
   audio group), with a 3 s / 1.5 MB analysis window and a fast TCP pre-check — a
   live "endless" SSAI feed must not produce a false DOWN.
