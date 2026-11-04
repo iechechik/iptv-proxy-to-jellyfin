@@ -23,7 +23,7 @@ from core.config import (
 )
 from services.hls_utils import (
     _is_ad_url, _extract_url_expiry, _EXPIRY_SAFETY_MARGIN,
-    probe_stream_types, _is_error_url,
+    probe_stream_types, _is_error_url, tcp_reachable,
 )
 from services.ad_detect import _is_ad_manifest
 
@@ -430,6 +430,15 @@ def _run_browser_sniffer_sync(target_url: str, ua: str, max_timeout: int, skip_u
     tag = f"'{channel_name}': " if channel_name else ""
     user_agent = ua or IPTV_DEFAULT_UA
     exec_path = IPTV_PLAYWRIGHT_CHROMIUM
+
+    # sniffer-tcp-precheck-v1: мёртвый сайт не должен занимать слот семафора
+    # и держать Chromium до таймаута навигации (две попытки × nav_timeout).
+    # Проверка стоит секунды, запуск браузера — десятки секунд.
+    if not tcp_reachable(target_url, timeout=3.0):
+        logger.warning(f"[SNIFFER] {tag}хост не отвечает (TCP, 3 с) — "
+                       f"браузер не запускаем: {target_url}")
+        return None
+
     browser = None
     context = None
     page = None

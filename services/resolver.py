@@ -127,6 +127,24 @@ def _flare_raise_flag(reason: str) -> None:
         logger.warning(f"[FLARE-FLAG] failed to raise flag: {e}")
 
 
+def _flare_raise_flag_if_down(exc: BaseException) -> None:
+    """Флаг = «решатель недоступен», а не «страница не поддалась».
+
+    Раньше флаг ставился на ЛЮБУЮ ошибку — включая 500 от самого решателя
+    (iframe about:blank) и «regex не совпал». После этого КАЖДЫЙ flare-резолв
+    падал с «restart pending», то есть канал выглядел мёртвым, хотя
+    перезапускать было нечего.
+    """
+    if hasattr(exc, "code"):        # HTTPError: сервер ответил, значит он жив
+        return
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "restart pending" in text:
+        return
+    if any(k in text for k in ("connection refused", "connection reset", "timed out",
+                               "timeout", "unreachable", "no route", "errno 111")):
+        _flare_raise_flag(str(exc))
+
+
 def resolve_via_flaresolverr_simple(page_url: str, extract_regex: str) -> str:
     if _flare_flag_exists():
         raise RuntimeError("FlareSolverr restart pending (flag file)")
@@ -148,11 +166,15 @@ def resolve_via_flaresolverr_simple(page_url: str, extract_regex: str) -> str:
             raise RuntimeError("regex did not match flaresolverr response")
         return match.group(0)
     except Exception as e:
-        _flare_raise_flag(str(e))
+        _flare_raise_flag_if_down(e)
         raise
 
 
-def resolve_via_flaresolverr_session(target_url: str, timeout: int = 15) -> str | None:
+def resolve_via_flaresolverr_session(target_url: str, timeout: int | None = None) -> str | None:
+    # 15 с хватало одному движку; при фолбэке chrome → stealth бюджет ДЕЛИТСЯ,
+    # и оба не успевают (Timeout after 7.5 s на 15-секундном запросе).
+    if timeout is None:
+        timeout = IPTV_FLARESOLVERR_TIMEOUT
     if _flare_flag_exists():
         raise RuntimeError("FlareSolverr restart pending (flag file)")
     session_id = f"proxy_session_{uuid.uuid4().hex[:12]}"
@@ -216,9 +238,16 @@ def resolve_via_flaresolverr_session(target_url: str, timeout: int = 15) -> str 
                 iframe_url = "https:" + iframe_url
             elif iframe_url.startswith("/"):
                 iframe_url = urljoin(target_url, iframe_url)
-            m3u8_in_iframe = extract_m3u8_from_text(iframe_url)
+            if not iframe_url.startswith(("http://", "https://")):
+                # about:blank / javascript: / пустой src: солвер отвечает на это 500,
+                # а 500 поднимал флаг «перезапустить решатель». Пропускаем молча.
+                logger.debug(f"[FLARESOLVERR] iframe не http ({iframe_url[:40]!r}) — пропуск")
+                iframe_url = ""
+            m3u8_in_iframe = extract_m3u8_from_text(iframe_url) if iframe_url else None
             if m3u8_in_iframe:
                 return _attach_headers_if_needed(m3u8_in_iframe)
+            if not iframe_url:
+                return None
             iframe_payload = json.dumps({
                 "cmd": "request.get", "session": session_id,
                 "url": iframe_url, "maxTimeout": timeout * 1000
@@ -235,7 +264,7 @@ def resolve_via_flaresolverr_session(target_url: str, timeout: int = 15) -> str 
                 return _attach_headers_if_needed(found)
     except Exception as e:
         logger.error(f"[FLARESOLVERR] session error: {e}")
-        _flare_raise_flag(str(e))
+        _flare_raise_flag_if_down(e)
     finally:
         try:
             req_destroy = urllib.request.Request(

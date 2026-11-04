@@ -13,6 +13,7 @@ set -u
 CONFIG_DIR="/opt/docker-compose/configs/iptv-proxy"
 FLAG="${CONFIG_DIR}/flags/flaresolverr_restart.request"
 LOG="${CONFIG_DIR}/logs/iptv-proxy.log"
+SOLVERR=solverr # or flaresolverr
 COOLDOWN=300
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - [flare-watchdog] - $*" >> "$LOG"; }
@@ -30,7 +31,7 @@ fi
 reason=$(head -1 "$FLAG" 2>/dev/null)
 log "Flag detected: $reason — restarting flaresolverr"
 
-if docker restart flaresolverr >> "$LOG" 2>&1; then
+if docker restart $SOLVERR >> "$LOG" 2>&1; then
     rm -f "$FLAG"
     echo "$now" > "$LAST"
     log "Restart OK, flag removed"
