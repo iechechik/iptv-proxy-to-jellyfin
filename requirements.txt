@@ -1,4 +1,5 @@
 yt-dlp
+bgutil-ytdlp-pot-provider
 fastapi
 uvicorn
 jinja2

@@ -5,9 +5,9 @@ import time
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from routers import system, web, stream, stream_hls, stream_mux, channels, channels_checks, channels_resolvers, epg, jellyfin, playlists
+from routers import system, web, stream, stream_hls, stream_mux, channels, channels_checks, channels_resolvers, epg, jellyfin, playlists, youtube_cookies, youtube_login
 import core.state as state
-from core.config import logger
+from core.config import logger, IPTV_YT_ACCOUNT_UI
 from services.healthcheck import (
     background_cleanup,
     start_healthcheck_scheduler
@@ -31,6 +31,11 @@ app.include_router(channels_resolvers.router)
 app.include_router(epg.router)
 app.include_router(jellyfin.router)
 app.include_router(playlists.router)
+# youtube-account-ui-v1: аккаунтная часть выключена по умолчанию
+# (SABR не поддерживается yt-dlp — логин для живых трансляций бесполезен).
+if IPTV_YT_ACCOUNT_UI:
+    app.include_router(youtube_cookies.router)
+    app.include_router(youtube_login.router)
 
 
 class NoCacheStaticFiles(StaticFiles):

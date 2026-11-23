@@ -163,6 +163,12 @@ IPTV_FALLBACK_SWITCH_SPEEDUP_SEC = float(os.getenv("IPTV_FALLBACK_SWITCH_SPEEDUP
 IPTV_SNIFFER_LIMIT = int(os.getenv("IPTV_SNIFFER_LIMIT", "5"))
 # embed-grace-v1: сколько ждать свой манифест, если страница уже отдала встройку.
 IPTV_SNIFFER_EMBED_GRACE = int(os.getenv("IPTV_SNIFFER_EMBED_GRACE", "9"))
+# pot-provider-v1: URL сервера PO-токенов (пусто = выключено).
+IPTV_POT_PROVIDER_URL = os.getenv("IPTV_POT_PROVIDER_URL", "")
+# youtube-account-ui-v1: UI входа в YouTube и профили cookies. По умолчанию
+# выключено: залогиненная сессия для живых трансляций упирается в SABR,
+# которого yt-dlp пока не умеет. Включать, когда это изменится.
+IPTV_YT_ACCOUNT_UI = os.getenv("IPTV_YT_ACCOUNT_UI", "0").lower() in ("1", "true", "yes", "on")
 IPTV_FLARESOLVERR_LIMIT = int(os.getenv("IPTV_FLARESOLVERR_LIMIT", "5"))
 IPTV_PROBE_LIMIT = int(os.getenv("IPTV_PROBE_LIMIT", "2"))
 IPTV_RESOLVER_LIMIT = int(os.getenv("IPTV_RESOLVER_LIMIT", "5"))
@@ -355,6 +361,12 @@ if CONFIG_DATA:
     IPTV_SNIFFER_LIMIT = get_config_value("limits", "sniffer", IPTV_SNIFFER_LIMIT)
     IPTV_SNIFFER_EMBED_GRACE = get_config_value(
         "resolver", "sniffer_embed_grace", IPTV_SNIFFER_EMBED_GRACE
+    )
+    IPTV_POT_PROVIDER_URL = get_config_value(
+        "resolver", "pot_provider_url", IPTV_POT_PROVIDER_URL
+    )
+    IPTV_YT_ACCOUNT_UI = get_config_value(
+        "youtube", "account_ui", IPTV_YT_ACCOUNT_UI
     )
     IPTV_FLARESOLVERR_LIMIT = get_config_value("limits", "flaresolverr", IPTV_FLARESOLVERR_LIMIT)
     IPTV_PROBE_LIMIT = get_config_value("limits", "probe", IPTV_PROBE_LIMIT)
@@ -649,6 +661,8 @@ def save_full_config(channels: list = None) -> bool:
         "default_ua": IPTV_DEFAULT_UA,
         "playwright_chromium": IPTV_PLAYWRIGHT_CHROMIUM,
         "sniffer_embed_grace": IPTV_SNIFFER_EMBED_GRACE,
+        "pot_provider_url": IPTV_POT_PROVIDER_URL,
+        "account_ui": IPTV_YT_ACCOUNT_UI,
         "flaresolverr_url": IPTV_FLARESOLVERR_URL,
         "order": IPTV_RESOLVER_ORDER,
         "streamlink_timeout": IPTV_STREAMLINK_TIMEOUT,

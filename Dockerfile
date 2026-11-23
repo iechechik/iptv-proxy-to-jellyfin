@@ -6,8 +6,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1
 
 # Системный Chromium + ffmpeg (из apt) + curl (для диагностики)
+# nodejs: JS-движок для yt-dlp (EJS, челленджи YouTube) — без него бот-проверка не решается.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium ffmpeg curl ca-certificates tini \
+    nodejs \
     && apt-get autoremove -y && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
     && rm -rf /usr/share/doc /usr/share/man /usr/share/locale /usr/share/info /usr/share/fonts/truetype/noto

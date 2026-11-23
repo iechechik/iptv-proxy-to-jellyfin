@@ -1,58 +1,21 @@
-# === Конфиги и секреты ===
+# Живая конфигурация и состояние — в репозиторий не идут
 config.json
-config.override.json
 override.json
-.env
-*.env
-!.env.example
-
-# === Рантайм-состояние ===
 cache.json
 channels.save
-channels.txt
+flags/
+logs/
+db
+
+# Генерируемые файлы EPG
 epg_filtered.xml.gz
 epg_filtered.xml.gz.md5
-*.tmp
-*.part
 
-# === База и логи ===
-db/
-!db/.gitkeep
-logs/
-!logs/.gitkeep
-flags/
-
-# === Бэкапы ===
-*.bak
-*.bak_*
-backup-logtags-*.tgz
-*.tgz
-*.tar.gz
-
-# === Python ===
-.venv/
-venv/
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+*.py[cod]
 
-# === Локальные рабочие заметки ===
-ALL.sh
-CONF.txt
-CORE.txt
-ROUTERS.txt
-SERVICE.txt
-WEB.txt
-flake8.sh
-
-# === Редакторы / OS ===
-.vscode/
-.idea/
-*.swp
-*.swo
+# Разное
+*.bak
+core.*
 .DS_Store
-Thumbs.db

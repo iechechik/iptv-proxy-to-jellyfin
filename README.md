@@ -214,6 +214,70 @@ healthcheck'а) живут в `config.json` → полная схема со в�
 манифеста. Если поставить его меньше, канал будет получать заглушку ровно тогда,
 когда ссылка вот-вот найдётся.
 
+## YouTube: PO-токены и JS-движок
+
+С 2026 года YouTube отдаёт живые потоки только тому клиенту, который проходит его
+JS-челленджи и предъявляет **PO-токен**. Без этого `yt-dlp` получает
+`Sign in to confirm you're not a bot` (анонимно) или `No video formats found`
+(с залогиненной сессией). Каналы, которые заходят на YouTube через встройку на
+сайте (France 24, Al Jazeera и подобные), упираются в ту же стену — сниффер
+находит `youtube.com/embed/…`, а дальше работает тот же механизм.
+
+Нужны две вещи, и обе нужны одновременно:
+
+1. **JS-движок.** В образе ставится `nodejs` (Node 20 из apt), резолвер передаёт
+   `yt-dlp --js-runtimes node`. Без движка YouTube не разбирается вообще, и
+   никакие токены не помогают — в логе будет
+   `No supported JavaScript runtime could be found`.
+2. **Провайдер PO-токенов** — отдельный контейнер с сервером bgutil:
+
+```yaml
+  bgutil-provider:
+    container_name: bgutil-provider
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    restart: unless-stopped
+    init: true
+    networks:
+      - dockernet
+```
+
+   Плагин к `yt-dlp` уже в `requirements.txt` (`bgutil-ytdlp-pot-provider`), а
+   адрес сервера задаётся ключом `resolver.pot_provider_url` в `override.json`:
+
+```json
+{"resolver": {"pot_provider_url": "http://bgutil-provider:4416"}}
+```
+
+   Когда ключ задан, yt-dlp для YouTube пробуется **первым** — streamlink про
+   PO-токены ничего не знает.
+
+Как проверить, что связка жива: в логе провайдера (`docker logs bgutil-provider`)
+появляются строки `Generated IntegrityToken` и `Generating POT for <id>`. Если лог
+молчит, плагин не достучался до сервера — проверьте написание extractor-arg и
+имя контейнера.
+
+Чего ждать **не** надо: PO-токен не пробивает бот-проверку сам по себе, она по IP.
+На выходе, который YouTube принимает, анонимный запрос с токеном работает. С
+залогиненной сессией от «подозрительного» аккаунта (свежий аккаунт, вход с
+датацентрового адреса) YouTube отвечает `No video formats found`, поэтому профиль
+cookies держим выключенным (`GET /youtube/cookies`, профиль не активен), пока он
+действительно не понадобится.
+
+### Аккаунтная часть (cookies, вход в YouTube)
+
+В проекте есть UI входа в YouTube и профили cookies (`/youtube/cookies`,
+`/youtube/login/*`), но по умолчанию она **выключена** ключом
+`youtube.account_ui` (или переменной `IPTV_YT_ACCOUNT_UI=1`).
+
+Причина: залогиненная сессия для **живых трансляций** упирается в протокол
+SABR, который yt-dlp пока не поддерживает — вместо потока будет
+`No video formats found`. Пока это так, аккаунт не помогает, а иногда мешает
+(активный профиль ломает рабочий анонимный путь).
+
+Включать, когда в yt-dlp появится SABR. Код при этом полностью рабочий:
+вход, захват cookies, профили, проверка.
+
+
 ## Кэш и расписание проверок
 
 Кэшируется не «ответ CDN», а **ссылка**, и TTL считается по её сроку жизни:
@@ -496,6 +560,14 @@ Unlicense — public domain. Делайте что хотите, без обяз
 ---
 
 # English (short summary)
+
+- **YouTube** now requires a JS runtime plus a PO token: the image ships `nodejs`
+  and yt-dlp gets `--js-runtimes node`; a `bgutil-provider` sidecar
+  (`brainicism/bgutil-ytdlp-pot-provider:latest`, network `dockernet`) serves tokens,
+  wired via `resolver.pot_provider_url` = `http://bgutil-provider:4416`. A PO token
+  does not defeat the IP-based bot check on its own, and a suspicious logged-in
+  session yields `No video formats found` — keep the cookies profile disabled unless
+  actually needed.
 
 A personal project, published as-is — no plans for further development.
 

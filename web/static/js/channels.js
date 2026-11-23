@@ -389,7 +389,7 @@ function addStreamFieldToDOM(stream, index) {
 
         <div style="display: flex; gap: 8px; margin-top: 10px; align-items: center;">
             <input type="text" class="stream-cached-url" readonly value="${stream.cached_stream || ''}" style="flex: 1; background: #111318; color: #60a5fa; cursor: pointer; padding: 6px 10px; border: 1px solid var(--border-color); border-radius: 6px; font-family: monospace;" onclick="copyStreamCachedUrl(${index})" title="Копировать">
-            <button class="btn-sm" onclick="checkStreamByIndex(${index})">Проверить поток</button>
+            <button class="btn-sm" onclick="checkStreamByIndex(${index}, this)">Проверить поток</button>
             <button class="btn-sm" onclick="probeStreamByIndex(${index})">Проверить ffprobe</button>
             <span class="stream-elapsed" style="font-size: 12px; color: var(--text-muted); min-width: 50px; text-align: center;">
                 ${stream.elapsed ? stream.elapsed.toFixed(1) + 'с' : '—'}
@@ -585,15 +585,23 @@ function probeChannelStream() {
 }
 
 // === Проверка отдельных стримов ===
-function checkStreamByIndex(index) {
+function checkStreamByIndex(index, btn) {
+    // Один клик = один браузер. Повторные клики плодили Chromium-ы и забивали
+    // слоты сниффера — из-за этого интерфейс и выглядел зависшим.
+    if (btn && btn.disabled) return;
+    const _restoreBtn = () => {
+        if (btn) { btn.disabled = false; btn.textContent = 'Проверить поток'; }
+    };
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Проверка…'; }
+
     const item = document.querySelector(`.stream-item[data-index="${index}"]`);
-    if (!item) { showToast('Стрим не найден'); return; }
+    if (!item) { _restoreBtn(); showToast('Стрим не найден'); return; }
     const url = item.querySelector('.stream-url')?.value || '';
     const resolver = item.querySelector('.stream-resolver')?.value || 'auto';
     const ua = item.querySelector('.stream-ua')?.value || '';
     const fs_regex = item.querySelector('.stream-fs-regex')?.value || '';
 
-    if (!url) { showToast('Нет URL у потока'); return; }
+    if (!url) { _restoreBtn(); showToast('Нет URL у потока'); return; }
 
     if (streamsData[index]) {
         streamsData[index].url = url;
@@ -648,7 +656,8 @@ function checkStreamByIndex(index) {
             statusEl.textContent = '❌ Сеть';
             statusEl.style.color = '#ef4444';
         }
-    });
+    })
+    .finally(_restoreBtn);
 }
 
 function probeStreamByIndex(index) {

@@ -32,6 +32,7 @@ from core.config import (
     IPTV_YOUTUBE_CACHE_TTL, IPTV_STREAMLINK_TIMEOUT,
     IPTV_FLARESOLVERR_TIMEOUT, IPTV_FLARESOLVERR_URL,
     IPTV_FETCH_TIMEOUT,
+    IPTV_POT_PROVIDER_URL,
     logger,
 )
 import core.config as cfg
@@ -280,7 +281,17 @@ def resolve_via_flaresolverr_session(target_url: str, timeout: int | None = None
 
 # ---------- yt-dlp ----------
 def resolve_via_ytdlp(url: str, ua: str):
-    cmd = ["yt-dlp", "-f", "bv*+ba/b", "-g", "--no-warnings", "--user-agent", ua, url]
+    from services import yt_cookies  # локально: хранилище нужно только на этом пути
+
+    cmd = ["yt-dlp", "-f", "bv*+ba/b", "-g", "--no-warnings", "--user-agent", ua,
+           "--js-runtimes", "node"]
+    cookie_file = yt_cookies.active_path()
+    if cookie_file:
+        cmd += ["--cookies", cookie_file]
+    if IPTV_POT_PROVIDER_URL:
+        # pot-provider-v1: плагин берёт PO-токен с нашего сервера-сайдкара.
+        cmd += ["--extractor-args", f"youtubepot-bgutilhttp:base_url={IPTV_POT_PROVIDER_URL}"]
+    cmd.append(url)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=IPTV_FETCH_TIMEOUT)
     if result.returncode != 0 or not result.stdout.strip():
         raise RuntimeError(result.stderr.strip() or "empty output")
@@ -299,6 +310,21 @@ def resolve_via_ytdlp(url: str, ua: str):
 
 
 def resolve_youtube_stream(url: str, ua: str, name: str):
+    # pot-provider-v1: streamlink о PO-токенах не знает и на защищённой сессии
+    # падает. Если провайдер настроен — сначала yt-dlp, streamlink как резерв.
+    if IPTV_POT_PROVIDER_URL:
+        try:
+            is_direct, payload = resolve_via_ytdlp(url, ua)
+            logger.info(f"[RESOLVE] '{name}': yt-dlp (youtube, pot) done")
+            return is_direct, payload, time.time() + IPTV_YOUTUBE_CACHE_TTL, "yt-dlp"
+        except Exception as e:
+            logger.warning(f"[RESOLVE] '{name}': yt-dlp (youtube, pot) failed: {e}")
+            if "Sign in to confirm" in str(e):
+                try:
+                    from services import yt_cookies
+                    yt_cookies.mark_expired(str(e)[:180])
+                except Exception:
+                    pass
     try:
         stream_url = resolve_streamlink(url)
         logger.info(f"[RESOLVE] '{name}': streamlink (youtube) done")
@@ -311,6 +337,16 @@ def resolve_youtube_stream(url: str, ua: str, name: str):
             return is_direct, payload, time.time() + IPTV_YOUTUBE_CACHE_TTL, "yt-dlp"
         except Exception as e2:
             logger.warning(f"[RESOLVE] '{name}': yt-dlp (youtube) failed: {e2}")
+            if "Sign in to confirm" in str(e2):
+                try:
+                    from services import yt_cookies
+                    yt_cookies.mark_expired(str(e2)[:180])
+                except Exception:
+                    pass
+                logger.warning(
+                    f"[RESOLVE] '{name}': cookies YouTube не приняты — обновите профиль "
+                    f"на вкладке «YouTube cookies»"
+                )
             raise RuntimeError(f"All YouTube methods failed for {name}")
 
 

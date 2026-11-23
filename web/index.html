@@ -26,6 +26,7 @@
             <button class="tab-link active" onclick="switchTab('channels')">Каналы</button>
             <button class="tab-link" onclick="switchTab('epg-sources')">EPG источники</button>
             <button class="tab-link" onclick="switchTab('playlist-sources')">Плейлисты</button>
+            <button class="tab-link" id="tab-btn-yt-cookies" style="display:none" onclick="switchTab('yt-cookies')">YouTube cookies</button>
             <button class="tab-link" onclick="switchTab('logs')">📋 Логи</button>
         </div>
 
@@ -84,6 +85,31 @@
                 <button onclick="refreshAllPlaylists()">🔄 Обновить все</button>
             </div>
             <div id="playlistSourcesTableContainer">Загрузка...</div>
+        </div>
+
+        <!-- Вкладка YouTube cookies -->
+        <div id="tab-yt-cookies" class="tab-content">
+            <div class="actions-bar">
+                <button onclick="loadYtCookies()">🔄 Обновить</button>
+                <button class="btn-primary" onclick="ytLoginOpen()">🔐 Войти в YouTube</button>
+            </div>
+            <div id="ytCookiesContainer">Загрузка...</div>
+
+            <div style="margin-top:18px; padding:14px; border:1px solid var(--border-color); border-radius:8px;">
+                <div style="margin-bottom:10px; font-weight:600;">Добавить или обновить cookies</div>
+                <div style="display:flex; gap:10px; align-items:center; margin-bottom:10px;">
+                    <label for="ytCookieName">Профиль:</label>
+                    <input id="ytCookieName" type="text" value="основной" style="width:200px;">
+                </div>
+                <textarea id="ytCookieText" placeholder="Вставьте сюда содержимое cookies.txt (формат Netscape)…"
+                          style="width:100%; height:150px; font-family:monospace; font-size:12px;"></textarea>
+                <div style="margin-top:10px; display:flex; gap:10px; align-items:center;">
+                    <button id="ytSaveBtn" class="btn-primary" onclick="ytSave()">Сохранить и проверить</button>
+                    <span style="color:var(--text-muted); font-size:12px;">
+                        Проверка занимает до минуты: сервис берёт один YouTube-канал из списка и пробует его с этими cookies.
+                    </span>
+                </div>
+            </div>
         </div>
 
         <!-- Вкладка Логи -->
@@ -296,10 +322,30 @@
             </div>
         </div>
     </div>
+    <!-- Вход в YouTube: живое окно браузера сервиса -->
+    <div id="ytLoginModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:9999; align-items:center; justify-content:center;">
+        <div style="max-width:1320px; width:96vw; max-height:94vh; overflow:auto; background:var(--bg-color,#fff); color:var(--text-color,#000); padding:16px; border-radius:10px; border:1px solid var(--border-color,#ccc);">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                <h3 style="margin:0;">Вход в YouTube</h3>
+                <button onclick="ytLoginClose()">Закрыть</button>
+            </div>
+            <div id="ytLoginStatus" style="margin-bottom:8px; color:var(--text-muted,#666);"></div>
+            <div style="position:relative; border:1px solid var(--border-color,#ccc); border-radius:8px; overflow:hidden; background:#000;">
+                <img id="ytLoginScreen" alt="Экран входа" style="display:block; width:100%; height:auto; cursor:crosshair; min-height:200px;">
+                <input id="ytLoginKeys" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
+                       style="position:absolute; left:-9999px; top:0; width:1px; height:1px; opacity:0;">
+            </div>
+            <div style="margin-top:8px; font-size:12px; color:var(--text-muted,#666);">
+                Кликните по картинке (это включит ввод), затем печатайте. Пароль и код из SMS вводятся в живое окно браузера сервиса — приложение их не сохраняет.
+            </div>
+        </div>
+    </div>
     <div id="toast">Уведомление</div>
     <script src="/static/js/common.js"></script>
     <script src="/static/js/epg-sources.js"></script>
     <script src="/static/js/playlists.js"></script>
+    <script src="/static/js/yt-cookies.js"></script>
+    <script src="/static/js/yt-login.js"></script>
     <script src="/static/js/channels.js"></script>
     <script src="/static/js/main.js"></script>
 </body>
